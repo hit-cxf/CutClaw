@@ -2,13 +2,121 @@ import os
 from concurrent.futures import ProcessPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
 
+import av
 import numpy as np
 from tqdm import tqdm
-from decord import VideoReader, cpu, gpu
-from decord._ffi.base import DECORDError
 from PIL import Image
 from scenedetect import AdaptiveDetector, SceneManager, open_video
 from scenedetect.backends.pyav import VideoStreamAv
+
+try:
+    from decord import VideoReader, cpu, gpu
+    from decord._ffi.base import DECORDError
+    _DECORD_AVAILABLE = True
+except Exception:
+    VideoReader = Any
+    DECORDError = Exception
+    _DECORD_AVAILABLE = False
+
+    def cpu(_index=0):
+        return None
+
+    def gpu(_index=0):
+        return None
+
+
+class _NumpyFrame:
+    def __init__(self, array: np.ndarray):
+        self._array = array
+
+    def asnumpy(self) -> np.ndarray:
+        return self._array
+
+    @property
+    def shape(self):
+        return self._array.shape
+
+
+class _NumpyBatch:
+    def __init__(self, array: np.ndarray):
+        self._array = array
+
+    def asnumpy(self) -> np.ndarray:
+        return self._array
+
+
+class PyAVVideoReader:
+    """Small decord-compatible reader used when decord is unavailable.
+
+    This fallback favors portability over speed. It supports only the methods
+    CutClaw uses: len(), get_avg_fps(), __getitem__(), and get_batch().
+    """
+
+    def __init__(
+        self,
+        video_path: str,
+        height: Optional[int] = None,
+        width: Optional[int] = None,
+        **_: Any,
+    ):
+        self.video_path = video_path
+        self.height = height
+        self.width = width
+
+        with av.open(video_path) as container:
+            stream = container.streams.video[0]
+            rate = stream.average_rate or stream.base_rate
+            self._fps = float(rate) if rate else 24.0
+            self._native_width = int(stream.codec_context.width or stream.width or 0)
+            self._native_height = int(stream.codec_context.height or stream.height or 0)
+            if stream.frames:
+                self._num_frames = int(stream.frames)
+            elif container.duration:
+                self._num_frames = max(0, int((container.duration / av.time_base) * self._fps))
+            else:
+                self._num_frames = 0
+
+    def __len__(self) -> int:
+        return self._num_frames
+
+    def get_avg_fps(self) -> float:
+        return self._fps
+
+    def _resize_if_needed(self, array: np.ndarray) -> np.ndarray:
+        if self.height is None or self.width is None:
+            return array
+        image = Image.fromarray(array)
+        image = image.resize((int(self.width), int(self.height)), Image.Resampling.BILINEAR)
+        return np.asarray(image)
+
+    def get_batch(self, indices: List[int]) -> _NumpyBatch:
+        if not indices:
+            return _NumpyBatch(np.empty((0, 0, 0, 3), dtype=np.uint8))
+
+        wanted = {int(i) for i in indices if int(i) >= 0}
+        max_index = max(wanted)
+        frames: Dict[int, np.ndarray] = {}
+
+        with av.open(self.video_path) as container:
+            stream = container.streams.video[0]
+            for frame_idx, frame in enumerate(container.decode(stream)):
+                if frame_idx in wanted:
+                    arr = frame.to_ndarray(format="rgb24")
+                    frames[frame_idx] = self._resize_if_needed(arr)
+                    if len(frames) == len(wanted):
+                        break
+                if frame_idx > max_index:
+                    break
+
+        if not frames:
+            raise IndexError(f"No requested frames were decoded from {self.video_path}")
+
+        fallback = frames[sorted(frames.keys())[-1]]
+        ordered = [frames.get(int(i), fallback) for i in indices]
+        return _NumpyBatch(np.stack(ordered, axis=0))
+
+    def __getitem__(self, index: int) -> _NumpyFrame:
+        return _NumpyFrame(self.get_batch([int(index)]).asnumpy()[0])
 
 
 def _ensure_dir(path: str) -> None:
@@ -24,6 +132,8 @@ def _get_decord_ctx():
     The check is cached after the first call via _create_decord_reader, which
     has the video path needed to trigger decord's CUDA validation.
     """
+    if not _DECORD_AVAILABLE:
+        return None
     global _decord_ctx
     if _decord_ctx is None:
         return gpu(0)  # tentative; _create_decord_reader will confirm
@@ -62,6 +172,27 @@ def _create_decord_reader(
     target_resolution: Optional[Tuple[int, int]] = None,
 ) -> VideoReader:
     global _decord_ctx
+
+    if not _DECORD_AVAILABLE:
+        if target_resolution is None:
+            return PyAVVideoReader(video_path)
+        if isinstance(target_resolution, (tuple, list)) and len(target_resolution) == 2:
+            return PyAVVideoReader(
+                video_path,
+                height=int(target_resolution[0]),
+                width=int(target_resolution[1]),
+            )
+
+        short_side = int(target_resolution[0]) if isinstance(target_resolution, (tuple, list)) else int(target_resolution)
+        probe = PyAVVideoReader(video_path)
+        native_h, native_w = probe[0].shape[:2]
+        if native_h <= native_w:
+            target_h = short_side
+            target_w = int(round(native_w * short_side / native_h / 2) * 2)
+        else:
+            target_w = short_side
+            target_h = int(round(native_h * short_side / native_w / 2) * 2)
+        return PyAVVideoReader(video_path, height=target_h, width=target_w)
 
     def _make_reader(path, ctx, **kwargs):
         """Try to open VideoReader; fall back to CPU if decord lacks CUDA support."""

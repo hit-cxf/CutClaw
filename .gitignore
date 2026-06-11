@@ -9,6 +9,9 @@ wheels/
 # Virtual environments
 .venv
 .conda
+.env
+.env.*
+!.env.example
 
 # working directory
 .working_dir/

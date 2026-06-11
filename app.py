@@ -12,6 +12,12 @@ logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").set
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(PROJECT_ROOT, "src", "config.py")
+ENV_PATH = os.path.join(PROJECT_ROOT, ".env")
+ENV_CONFIG_KEYS = {
+    "VIDEO_ANALYSIS_API_KEY",
+    "AUDIO_LITELLM_API_KEY",
+    "AGENT_LITELLM_API_KEY",
+}
 MIN_TARGET_SHOT_LENGTH_SEC = 0.2
 MIN_SEGMENT_DURATION_FLOOR_SEC = 0.1
 SHOT_LENGTH_RANGE_CAP_SEC = 1.0
@@ -28,8 +34,36 @@ def _read_config() -> dict:
     return vals
 
 
+def _read_env() -> dict:
+    """Read simple KEY=VALUE pairs from .env as strings."""
+    vals = {}
+    if not os.path.exists(ENV_PATH):
+        return vals
+    with open(ENV_PATH, "r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            vals[key.strip()] = value.strip().strip('"').strip("'")
+    return vals
+
+
+def _write_env_value(key: str, value: str):
+    """Create or update one KEY=VALUE entry in .env."""
+    vals = _read_env()
+    vals[key] = value
+    with open(ENV_PATH, "w", encoding="utf-8") as f:
+        for env_key in sorted(vals):
+            f.write(f"{env_key}={vals[env_key]}\n")
+
+
 def _cfg(key: str, fallback: str) -> str:
     """Get a config value as a plain string (strips quotes)."""
+    if key in ENV_CONFIG_KEYS:
+        env_value = _read_env().get(key)
+        if env_value is not None:
+            return env_value
     raw = _read_config().get(key, fallback)
     # strip surrounding quotes if present
     if (raw.startswith('"') and raw.endswith('"')) or \
@@ -39,7 +73,11 @@ def _cfg(key: str, fallback: str) -> str:
 
 
 def save_config(key: str, value: str):
-    """Overwrite a single key in config.py."""
+    """Overwrite a single key in config.py, or .env for sensitive keys."""
+    value = _sanitize_config_value(key, value)
+    if key in ENV_CONFIG_KEYS:
+        _write_env_value(key, value)
+        return
     with open(CONFIG_PATH, "r") as f:
         content = f.read()
     # Determine whether to quote: if original had quotes or value is not numeric
@@ -56,6 +94,32 @@ def save_config(key: str, value: str):
     )
     with open(CONFIG_PATH, "w") as f:
         f.write(content)
+
+
+def _sanitize_config_value(key: str, value: str) -> str:
+    """Normalize common pasted config snippets before persisting them."""
+    value = str(value).strip()
+
+    assignment = re.match(r'^[A-Z_][A-Z0-9_]*\s*=\s*(.+)$', value)
+    if assignment:
+        value = assignment.group(1).strip()
+
+    if (value.startswith('"') and value.endswith('"')) or (
+        value.startswith("'") and value.endswith("'")
+    ):
+        value = value[1:-1].strip()
+
+    if key.endswith(("ENDPOINT", "URL", "BASE_URL")):
+        value = value.replace(
+            "https://dashscope.aliyuncs.com/api/v1",
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        )
+        value = value.replace(
+            "https://dashscope.aliyuncs.com/api/v1/",
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        )
+
+    return value
 
 
 def _persist_target_output_length(target_length: float):
@@ -481,13 +545,10 @@ def start_pipeline(video_path, audio_path, instruction, video_type, main_charact
         "--config.AUDIO_MAX_SEGMENT_DURATION", str(max_seg_duration),
         "--config.VIDEO_ANALYSIS_MODEL", video_analysis_model,
         "--config.VIDEO_ANALYSIS_ENDPOINT", video_analysis_endpoint,
-        "--config.VIDEO_ANALYSIS_API_KEY", video_analysis_api_key,
         "--config.AUDIO_LITELLM_MODEL", audio_litellm_model,
         "--config.AUDIO_LITELLM_BASE_URL", audio_litellm_base_url,
-        "--config.AUDIO_LITELLM_API_KEY", audio_litellm_api_key,
         "--config.AGENT_LITELLM_MODEL", agent_litellm_model,
         "--config.AGENT_LITELLM_URL", agent_litellm_url,
-        "--config.AGENT_LITELLM_API_KEY", agent_litellm_api_key,
     ]
     if main_character.strip():
         cmd += ["--config.MAIN_CHARACTER_NAME", main_character.strip()]

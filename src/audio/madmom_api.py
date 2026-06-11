@@ -154,41 +154,67 @@ def detect_keypoints_madmom(
     analysis_audio_path = _ensure_wav_for_aubio(audio_path)
 
     # Import from the patched module (this applies Python/NumPy compatibility fixes
-    # *before* importing madmom).
-    from src.audio.audio_Madmom import (  # noqa: WPS433 (runtime import)
-        SensoryKeypointDetector,
-        filter_significant_keypoints,
-    )
+    # *before* importing madmom). Fall back to a lightweight energy detector when
+    # the legacy madmom/aubio stack is not installed, which is common on macOS.
+    try:
+        from src.audio.audio_Madmom import (  # noqa: WPS433 (runtime import)
+            SensoryKeypointDetector,
+            filter_significant_keypoints,
+        )
+    except Exception as exc:
+        print(
+            "[Audio] madmom stack is unavailable; using scipy energy fallback "
+            f"for {detection_method!r} detection. Original error: {exc}"
+        )
+        result = detect_keypoints_energy_fallback(
+            audio_path=analysis_audio_path,
+            detection_method=detection_method,
+            min_distance={
+                "downbeat": max(0.3, 60.0 / max(float(max_bpm), 1.0)),
+                "pitch": pitch_min_distance,
+                "mel_energy": mel_min_distance,
+            }.get(detection_method, 0.5),
+            threshold_ratio={
+                "downbeat": dbn_threshold,
+                "pitch": pitch_threshold,
+                "mel_energy": mel_threshold_ratio,
+            }.get(detection_method, 0.3),
+            max_points={
+                "pitch": pitch_max_points,
+                "mel_energy": mel_max_points,
+            }.get(detection_method, 0),
+        )
+        filter_significant_keypoints = filter_significant_keypoints_basic
+    else:
+        # Create detector with method-specific parameters
+        detector = SensoryKeypointDetector(
+            detection_method=detection_method,
+            # Downbeat parameters (always passed, used only if method="downbeat")
+            beats_per_bar=[int(beats_per_bar)],
+            dbn_threshold=float(dbn_threshold),
+            min_bpm=float(min_bpm),
+            max_bpm=float(max_bpm),
+            num_tempi=int(num_tempi),
+            transition_lambda=float(transition_lambda),
+            observation_lambda=int(observation_lambda),
+            correct_beats=bool(correct_beats),
+            fps=int(fps),
+            # Pitch parameters (used only if method="pitch")
+            pitch_tolerance=float(pitch_tolerance),
+            pitch_threshold=float(pitch_threshold),
+            pitch_min_distance=float(pitch_min_distance),
+            pitch_nms_method=str(pitch_nms_method),
+            pitch_max_points=int(pitch_max_points),
+            # Mel parameters (used only if method="mel_energy")
+            mel_win_s=int(mel_win_s),
+            mel_n_filters=int(mel_n_filters),
+            mel_threshold_ratio=float(mel_threshold_ratio),
+            mel_min_distance=float(mel_min_distance),
+            mel_nms_method=str(mel_nms_method),
+            mel_max_points=int(mel_max_points),
+        )
 
-    # Create detector with method-specific parameters
-    detector = SensoryKeypointDetector(
-        detection_method=detection_method,
-        # Downbeat parameters (always passed, used only if method="downbeat")
-        beats_per_bar=[int(beats_per_bar)],
-        dbn_threshold=float(dbn_threshold),
-        min_bpm=float(min_bpm),
-        max_bpm=float(max_bpm),
-        num_tempi=int(num_tempi),
-        transition_lambda=float(transition_lambda),
-        observation_lambda=int(observation_lambda),
-        correct_beats=bool(correct_beats),
-        fps=int(fps),
-        # Pitch parameters (used only if method="pitch")
-        pitch_tolerance=float(pitch_tolerance),
-        pitch_threshold=float(pitch_threshold),
-        pitch_min_distance=float(pitch_min_distance),
-        pitch_nms_method=str(pitch_nms_method),
-        pitch_max_points=int(pitch_max_points),
-        # Mel parameters (used only if method="mel_energy")
-        mel_win_s=int(mel_win_s),
-        mel_n_filters=int(mel_n_filters),
-        mel_threshold_ratio=float(mel_threshold_ratio),
-        mel_min_distance=float(mel_min_distance),
-        mel_nms_method=str(mel_nms_method),
-        mel_max_points=int(mel_max_points),
-    )
-
-    result = detector.analyze(analysis_audio_path)
+        result = detector.analyze(analysis_audio_path)
 
     # Apply silence filtering if requested
     if silence_filter and result.get("keypoints"):
@@ -237,6 +263,177 @@ def detect_keypoints_madmom(
         return normalized
 
     return result
+
+
+def detect_keypoints_energy_fallback(
+    audio_path: str,
+    *,
+    detection_method: str = "mel_energy",
+    sr: int = 16000,
+    frame_length: int = 2048,
+    hop_length: int = 512,
+    min_distance: float = 0.5,
+    threshold_ratio: float = 0.3,
+    max_points: int = 0,
+) -> Dict[str, Any]:
+    """Portable scipy-based keypoint detector used when madmom is unavailable."""
+    import numpy as np
+    from scipy.signal import find_peaks
+    from src.audio.audio_utils import load_audio_no_librosa  # noqa: WPS433
+
+    audio = load_audio_no_librosa(audio_path, sr=sr)
+    if audio is None or len(audio) == 0:
+        return {"success": False, "keypoints": [], "meta": {"backend": "energy_fallback"}}
+
+    audio = np.asarray(audio, dtype=np.float32)
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+
+    if len(audio) < frame_length:
+        frame_length = max(256, len(audio))
+        hop_length = max(128, frame_length // 4)
+
+    starts = np.arange(0, max(1, len(audio) - frame_length + 1), hop_length)
+    if len(starts) == 0:
+        starts = np.array([0])
+
+    rms = []
+    for start in starts:
+        frame = audio[start : start + frame_length]
+        rms.append(float(np.sqrt(np.mean(frame * frame) + 1e-12)))
+    envelope = np.asarray(rms, dtype=np.float32)
+
+    if envelope.size == 0 or float(envelope.max()) <= 0:
+        return {"success": False, "keypoints": [], "meta": {"backend": "energy_fallback"}}
+
+    smoothed = np.convolve(envelope, np.ones(5, dtype=np.float32) / 5.0, mode="same")
+    normalized = smoothed / max(float(smoothed.max()), 1e-12)
+    distance_frames = max(1, int(float(min_distance) * sr / hop_length))
+    height = max(0.05, min(0.95, float(threshold_ratio)))
+    peaks, props = find_peaks(normalized, height=height, distance=distance_frames)
+
+    if peaks.size == 0:
+        step = max(distance_frames, int(1.5 * sr / hop_length))
+        peaks = np.arange(step, len(normalized), step, dtype=int)
+        props = {"peak_heights": normalized[peaks] if peaks.size else np.asarray([], dtype=np.float32)}
+
+    if max_points and peaks.size > max_points:
+        heights = props.get("peak_heights", normalized[peaks])
+        keep = np.argsort(heights)[-int(max_points):]
+        peaks = np.sort(peaks[keep])
+
+    type_name = {
+        "downbeat": "Energy Downbeat",
+        "pitch": "Energy Pitch",
+        "mel_energy": "Mel Energy",
+    }.get(detection_method, "Energy")
+
+    keypoints = []
+    for peak in peaks:
+        time_s = float(starts[int(peak)] / sr)
+        intensity = float(normalized[int(peak)])
+        keypoints.append({
+            "time": round(time_s, 3),
+            "type": type_name,
+            "intensity": round(intensity, 6),
+            "normalized_intensity": round(intensity, 6),
+        })
+
+    return {
+        "success": True,
+        "keypoints": keypoints,
+        "timestamps": [kp["time"] for kp in keypoints],
+        "meta": {
+            "backend": "energy_fallback",
+            "detection_method": detection_method,
+            "sample_rate": sr,
+        },
+    }
+
+
+def filter_significant_keypoints_basic(
+    keypoints: List[dict],
+    min_interval: float = 0.0,
+    top_k: int = 0,
+    energy_percentile: float = 0.0,
+    use_normalized_intensity: bool = True,
+) -> List[dict]:
+    """Small replacement for audio_Madmom.filter_significant_keypoints."""
+    if not keypoints:
+        return []
+
+    filtered = [dict(kp) for kp in keypoints]
+    intensity_key = "normalized_intensity" if use_normalized_intensity else "intensity"
+    for kp in filtered:
+        intensity = float(kp.get("intensity", kp.get("normalized_intensity", 0.0)))
+        kp.setdefault("intensity", intensity)
+        kp.setdefault("normalized_intensity", intensity)
+
+    if energy_percentile > 0:
+        import numpy as np
+
+        threshold = float(np.percentile([kp[intensity_key] for kp in filtered], energy_percentile))
+        filtered = [kp for kp in filtered if float(kp[intensity_key]) >= threshold]
+
+    if top_k > 0:
+        filtered = sorted(filtered, key=lambda kp: float(kp.get(intensity_key, 0.0)), reverse=True)[: int(top_k)]
+
+    if min_interval > 0 and filtered:
+        selected = []
+        for kp in sorted(filtered, key=lambda item: float(item.get(intensity_key, 0.0)), reverse=True):
+            t = float(kp.get("time", 0.0))
+            if all(abs(t - float(prev.get("time", 0.0))) >= min_interval for prev in selected):
+                selected.append(kp)
+        filtered = selected
+
+    return sorted(filtered, key=lambda kp: float(kp.get("time", 0.0)))
+
+
+def filter_by_sections_basic(
+    keypoints: List[dict],
+    sections: List[dict],
+    section_min_interval: float = 0.0,
+    use_normalized_intensity: bool = True,
+    min_segment_duration: float = 3.0,
+    max_segment_duration: float = 15.0,
+    total_shots: int = 20,
+    audio_duration: float = None,
+    **_: Any,
+) -> List[dict]:
+    """Portable section-aware filter used when audio_Madmom is unavailable."""
+    if not keypoints or not sections:
+        return keypoints
+
+    def _as_seconds(value: Any) -> float:
+        if isinstance(value, (int, float)):
+            return float(value)
+        text = str(value)
+        parts = text.split(":")
+        if len(parts) == 2:
+            return int(parts[0]) * 60 + float(parts[1])
+        if len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+        return float(text)
+
+    kept = []
+    for sec in sections:
+        start = _as_seconds(sec.get("start_time", sec.get("Start_Time", 0)))
+        end = _as_seconds(sec.get("end_time", sec.get("End_Time", audio_duration or start)))
+        if end <= start:
+            continue
+        section_points = [kp for kp in keypoints if start <= float(kp.get("time", 0.0)) < end]
+        duration = max(end - start, 1e-6)
+        section_quota = max(1, int(round((duration / max(audio_duration or duration, duration)) * total_shots)))
+        kept.extend(
+            filter_significant_keypoints_basic(
+                section_points,
+                min_interval=section_min_interval or min_segment_duration,
+                top_k=section_quota,
+                use_normalized_intensity=use_normalized_intensity,
+            )
+        )
+
+    return sorted(kept, key=lambda kp: float(kp.get("time", 0.0)))
 
 
 def detect_keypoints_madmom_from_params(

@@ -583,10 +583,20 @@ def caption_audio_with_madmom_segments(
     if madmom_module_path not in sys.path:
         sys.path.insert(0, madmom_module_path)
 
-    from audio_Madmom import (
-        filter_significant_keypoints,
-        filter_by_sections,
-    )
+    try:
+        from audio_Madmom import (
+            filter_significant_keypoints,
+            filter_by_sections,
+        )
+    except Exception as exc:
+        print(
+            "[Audio] audio_Madmom filters are unavailable; using portable "
+            f"fallback filters. Original error: {exc}"
+        )
+        from src.audio.madmom_api import (
+            filter_significant_keypoints_basic as filter_significant_keypoints,
+            filter_by_sections_basic as filter_by_sections,
+        )
 
     # Resolve max_workers (batch_size is a deprecated alias)
     if max_workers is None:

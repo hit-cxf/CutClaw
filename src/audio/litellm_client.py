@@ -2,7 +2,7 @@
 Lightweight litellm wrapper for audio analysis via cloud API.
 
 Reads configuration from src/audio/.env:
-  AUDIO_MODEL    - LiteLLM model string (e.g. openai/Qwen3-Omni-30B-A3B-Instruct)
+  AUDIO_MODEL    - LiteLLM model string (e.g. dashscope/qwen3.5-omni-plus)
   AUDIO_API_KEY  - API key (use EMPTY for no auth)
   AUDIO_BASE_URL - Base URL for OpenAI-compatible endpoints
 """
@@ -43,7 +43,7 @@ def _get_setting(config_key: str, env_key: str, default=None):
 AUDIO_MODEL = _get_setting(
     config_key="AUDIO_LITELLM_MODEL",
     env_key="AUDIO_MODEL",
-    default="openai/Qwen3-Omni-30B-A3B-Instruct",
+    default="dashscope/qwen3.5-omni-plus",
 )
 AUDIO_API_KEY = _get_setting(
     config_key="AUDIO_LITELLM_API_KEY",
@@ -71,6 +71,26 @@ def _audio_to_base64_mp3(audio_path: str) -> str:
     finally:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
+
+
+def _is_qwen_omni_model(model: str) -> bool:
+    """Return True for Qwen Omni models that require streaming audio calls."""
+    model_name = (model or "").split("/")[-1].lower()
+    return "qwen" in model_name and "omni" in model_name
+
+
+async def _collect_stream_text(stream) -> str:
+    """Collect text deltas from LiteLLM/OpenAI-compatible streaming chunks."""
+    chunks = []
+    async for chunk in stream:
+        choices = getattr(chunk, "choices", None)
+        if not choices:
+            continue
+        delta = getattr(choices[0], "delta", None)
+        content = getattr(delta, "content", None) if delta is not None else None
+        if content:
+            chunks.append(content)
+    return "".join(chunks)
 
 
 @retry(
@@ -110,22 +130,41 @@ async def acall_audio_api(
     # ffmpeg conversion only runs once — not included in the retry scope
     audio_b64 = await loop.run_in_executor(None, _audio_to_base64_mp3, audio_path)
 
-    response = await litellm.acompletion(
-        model=AUDIO_MODEL,
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": f"data:audio/mp3;base64,{audio_b64}"}},
-            ],
-        }],
-        temperature=temperature,
-        top_p=top_p,
-        max_tokens=max_tokens,
-        timeout=300,
-        api_key=AUDIO_API_KEY,
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": prompt},
+            {
+                "type": "input_audio",
+                "input_audio": {
+                    "data": f"data:audio/mp3;base64,{audio_b64}",
+                    "format": "mp3",
+                },
+            },
+        ],
+    }]
+
+    kwargs = {
+        "model": AUDIO_MODEL,
+        "messages": messages,
+        "temperature": temperature,
+        "top_p": top_p,
+        "max_tokens": max_tokens,
+        "timeout": 300,
+        "api_key": AUDIO_API_KEY,
         **({"api_base": AUDIO_BASE_URL} if AUDIO_BASE_URL else {}),
-    )
+    }
+
+    if _is_qwen_omni_model(AUDIO_MODEL):
+        response_stream = await litellm.acompletion(
+            **kwargs,
+            modalities=["text"],
+            stream=True,
+            stream_options={"include_usage": True},
+        )
+        return await _collect_stream_text(response_stream)
+
+    response = await litellm.acompletion(**kwargs)
 
     return response.choices[0].message.content
 

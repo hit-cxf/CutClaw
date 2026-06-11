@@ -1,5 +1,29 @@
 import os
 
+
+def _load_project_env() -> None:
+    """Load simple KEY=VALUE pairs from the project .env without extra deps."""
+    env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
+    if not os.path.exists(env_path):
+        return
+    with open(env_path, "r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+
+def _env(key: str, default: str = "") -> str:
+    return os.getenv(key, default)
+
+
+_load_project_env()
+
 # ==============================================================================
 # CutClaw global configuration (beginner-friendly version)
 # ------------------------------------------------------------------------------
@@ -17,9 +41,9 @@ import os
 # ------------------ UI Remembered Inputs ------------------ #
 # These are saved automatically by the app when you change sidebar fields.
 
-VIDEO_PATH = ""
-AUDIO_PATH = ""
-INSTRUCTION = ""
+VIDEO_PATH = "resource/video/5.mp4"
+AUDIO_PATH = "resource/audio/mixkit-beautiful-dream-493.mp3"
+INSTRUCTION = "做这个影片的精彩剪辑"
 SRT_PATH = ""
 
 
@@ -87,6 +111,10 @@ SHOT_DETECTION_MODEL = "scenedetect"
 
 CLIP_SECS = 30
 # Maximum length (seconds) of a single candidate clip.
+
+VIDEO_CAPTION_MAX_FRAMES_PER_CLIP = 12
+# Maximum frames sent to the VLM for each shot-caption request.
+# Lower values reduce request size and timeout risk on OpenAI-compatible APIs.
 
 MERGE_SHORT_SCENES = True
 # If True, consecutive short scenes are merged to reduce fragmentation.
@@ -176,16 +204,16 @@ SCENE_PROMPT_TYPE = VIDEO_TYPE
 VIDEO_ANALYSIS_MODEL_MAX_TOKEN = 16384 
 # Max output token count for the video analysis model.
 
-VIDEO_ANALYSIS_MODEL = ""
+VIDEO_ANALYSIS_MODEL = "dashscope/qwen3.7-plus"
 # Video semantic analysis model name (called via OpenAI-compatible endpoint).
 
-VIDEO_ANALYSIS_ENDPOINT = ""  
+VIDEO_ANALYSIS_ENDPOINT = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 # API base URL for the video analysis model.
 
-VIDEO_ANALYSIS_API_KEY = ""
+VIDEO_ANALYSIS_API_KEY = _env("VIDEO_ANALYSIS_API_KEY")
 # API key for the video analysis model.
 
-CAPTION_BATCH_SIZE = 64
+CAPTION_BATCH_SIZE = 4
 # Batch size for parallel clip captioning/analysis.
 
 SCENE_ANALYSIS_MIN_FRAMES = 6
@@ -196,13 +224,13 @@ SCENE_ANALYSIS_MIN_FRAMES = 6
 # ------------------ Audio Model ------------------ #
 # Analyzes musical beat/energy/structure and outputs editing keypoints.
 
-AUDIO_LITELLM_MODEL = ""
+AUDIO_LITELLM_MODEL = "dashscope/qwen3.5-omni-plus"
 # Cloud model used for audio captioning and structure analysis.
 
-AUDIO_LITELLM_API_KEY = ""
+AUDIO_LITELLM_API_KEY = _env("AUDIO_LITELLM_API_KEY")
 # API key for the audio model.
 
-AUDIO_LITELLM_BASE_URL = ""
+AUDIO_LITELLM_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 # API base URL for the audio model.
 
 AUDIO_DETECTION_METHODS = ["downbeat", "pitch", "mel_energy"]
@@ -276,10 +304,10 @@ AUDIO_SILENCE_THRESHOLD_DB = -45.0
 # Segments below this level are treated as too quiet and filtered.
 
 # ----- Audio segment duration constraints (frequently tuned) -----
-AUDIO_MIN_SEGMENT_DURATION = 0.1
+AUDIO_MIN_SEGMENT_DURATION = 1.0
 # Minimum segment duration (seconds). Smaller values create faster cuts.
 
-AUDIO_MAX_SEGMENT_DURATION = 2.0
+AUDIO_MAX_SEGMENT_DURATION = 3.0
 # Maximum segment duration (seconds). Larger values create slower pacing.
 
 # ----- Music structure analysis (Level-1) -----
@@ -344,13 +372,13 @@ ENABLE_TRIM_SHOT_CHARACTER_ANALYSIS = True
 CORE_MAX_FRAMES = 60
 # Maximum sampled frames per clip for core + reviewer analysis.
 
-AGENT_LITELLM_URL = ""
+AGENT_LITELLM_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 # API base URL for the agent LLM.
 
-AGENT_LITELLM_API_KEY = ""
+AGENT_LITELLM_API_KEY = _env("AGENT_LITELLM_API_KEY")
 # API key for the agent LLM.
 
-AGENT_LITELLM_MODEL = ""
+AGENT_LITELLM_MODEL = "dashscope/qwen3.7-max"
 # Primary model for the agent.
 
 PARALLEL_SHOT_ENABLED = True
@@ -383,7 +411,7 @@ FACE_QUALITY_CHECK_METHOD = "vlm"
 
 # ------------------ Protagonist Presence Constraints ------------------ #
 
-MAIN_CHARACTER_NAME = ""
+MAIN_CHARACTER_NAME = "林小舟"
 # Main character / target subject name (comma-separated for multiple roles).
 # This is one of the highest-impact parameters in object mode.
 
@@ -414,5 +442,3 @@ SCENE_EXPLORATION_RANGE = 3
 # Extra exploration range around recommended scenes (±N scenes).
 # Example: if recommended scene is 8 and range=3, search scene 5~11.
 # Set to 0 to strictly limit selection to recommended scenes only.
-
-

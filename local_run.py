@@ -60,7 +60,8 @@ def parse_config_overrides(unknown_args):
                             value = value_str
 
                 setattr(config, param_name, value)
-                print(f"✅ Config override: {param_name} = {value} (type: {type(value).__name__})")
+                display_value = "********" if param_name.endswith("API_KEY") else value
+                print(f"✅ Config override: {param_name} = {display_value} (type: {type(value).__name__})")
                 i += 2
             else:
                 print(f"⚠️ Warning: --config.{param_name} specified but no value provided")
@@ -68,6 +69,33 @@ def parse_config_overrides(unknown_args):
         else:
             print(f"⚠️ Warning: Unknown argument '{arg}' ignored")
             i += 1
+
+
+def srt_has_entries(path: str | None) -> bool:
+    """Return True only when an SRT file exists and contains parseable entries."""
+    if not path or not os.path.exists(path) or os.path.getsize(path) == 0:
+        return False
+    try:
+        from src.utils.media_utils import parse_srt_file
+        return bool(parse_srt_file(path))
+    except Exception as exc:
+        print(f"⚠️ Warning: failed to parse SRT {path}: {exc}")
+        return False
+
+
+def json_has_content(path: str | None) -> bool:
+    """Return True only when a JSON file exists and is not empty/null."""
+    if not path or not os.path.exists(path) or os.path.getsize(path) == 0:
+        return False
+    try:
+        import json
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return bool(data)
+    except Exception as exc:
+        print(f"⚠️ Warning: failed to parse JSON {path}: {exc}")
+        return False
+
 
 def main():
     parser = argparse.ArgumentParser(description="Run VideoCaptioningAgent on a video.")
@@ -184,7 +212,7 @@ def main():
             if args.type != "vlog":
                 if args.SRT_Path is not None:
                     print(f"🔤 [Thread A: ASR] External SRT provided, skipping ASR transcription: {args.SRT_Path}")
-                    if not os.path.exists(srt_path):
+                    if not srt_has_entries(srt_path):
                         enable_diarization = getattr(config, 'ASR_ENABLE_DIARIZATION', False)
                         if enable_diarization:
                             from src.video.preprocess.asr import extract_audio_mp3_16k
@@ -223,7 +251,8 @@ def main():
                         litellm_debug_dir=os.path.join(config.VIDEO_DATABASE_FOLDER, 'Video', video_id, "subtitles_segments"),
                     )
                 print("[Thread A: ASR] ✅ ASR/SRT step completed.")
-                if os.path.exists(srt_path) and not os.path.exists(character_info_path):
+                character_cache_valid = json_has_content(character_info_path) and srt_has_entries(srt_with_characters)
+                if srt_has_entries(srt_path) and not character_cache_valid:
                     print("[Thread A: CharID] 👥 Analyzing subtitles to identify characters...")
                     video_name = video_id.replace('_', ' ')
                     speaker_mapping, _character_info = analyze_subtitles(
@@ -237,7 +266,7 @@ def main():
                         max_tokens=config.VIDEO_ANALYSIS_MODEL_MAX_TOKEN,
                     )
                     print(f"[Thread A: CharID] ✅ Character identification completed. Found {len(speaker_mapping)} characters.")
-                elif os.path.exists(character_info_path):
+                elif character_cache_valid:
                     print(f"[Thread A: CharID] ⏭️ Character info already exists at {character_info_path}.")
                 else:
                     print(f"[Thread A: CharID] ⚠️ Subtitle file not found at {srt_path}, skipping character identification.")
@@ -268,8 +297,11 @@ def main():
                     subtitle_to_use = None
                     print("[Thread B: Video] 🎬 Processing vlog without subtitles.")
                 else:
-                    subtitle_to_use = srt_with_characters if os.path.exists(srt_with_characters) else srt_path
-                    print(f"[Thread B: Video] 🎬 Processing video with subtitle file: {subtitle_to_use}")
+                    subtitle_to_use = srt_with_characters if srt_has_entries(srt_with_characters) else srt_path if srt_has_entries(srt_path) else None
+                    if subtitle_to_use:
+                        print(f"[Thread B: Video] 🎬 Processing video with subtitle file: {subtitle_to_use}")
+                    else:
+                        print("[Thread B: Video] ⚠️ No usable subtitle entries found; processing video without dialogue context.")
                 process_video(
                     video=vr,
                     output_caption_folder=video_captions_dir,
@@ -309,7 +341,9 @@ def main():
                     subtitle_to_use = None
                     print("[Thread B: Analysis] 🔍 Analyzing scenes without subtitles for vlog.")
                 else:
-                    subtitle_to_use = srt_with_characters if os.path.exists(srt_with_characters) else srt_path
+                    subtitle_to_use = srt_with_characters if srt_has_entries(srt_with_characters) else srt_path if srt_has_entries(srt_path) else None
+                    if subtitle_to_use is None:
+                        print("[Thread B: Analysis] ⚠️ No usable subtitle entries found; analyzing scenes without dialogue context.")
                 analyzer = SceneVideoAnalyzer(vr=vr, subtitle_file=subtitle_to_use)
                 result = analyzer.analyze_scenes_dir(
                     scenes_dir=scenes_dir,
@@ -428,12 +462,19 @@ def main():
         os.makedirs(os.path.dirname(shot_plan_output_path), exist_ok=True)
 
         # Initialize Screenwriter agent
+        screenwriter_subtitle_path = None
+        if config.VIDEO_TYPE == "film":
+            if srt_has_entries(srt_with_characters):
+                screenwriter_subtitle_path = srt_with_characters
+            elif srt_has_entries(srt_path):
+                screenwriter_subtitle_path = srt_path
+
         screenwriter = Screenwriter(
             video_scene_path=scene_summaries_dir,
             audio_caption_path=audio_caption_file,
             output_path=shot_plan_output_path,
             video_path=Video_Path,
-            subtitle_path=srt_with_characters if config.VIDEO_TYPE == "film" and os.path.exists(srt_with_characters) else None,
+            subtitle_path=screenwriter_subtitle_path,
             main_character=config.MAIN_CHARACTER_NAME if config.MAIN_CHARACTER_NAME else None,
             max_iterations=20,
         )
@@ -448,7 +489,7 @@ def main():
         print(f"✅ Shot plan generated successfully in {stage_times['screenwriter']:.1f}s!")
         print(f"💾 Output saved to: {shot_plan_output_path}")
         print(f"{'='*80}\n")
-w
+
     # Step 6: Run EditorCoreAgent to select video clips based on shot plan
     # Check if we have all required files for core agent
     if os.path.exists(scene_summaries_dir) and os.path.exists(audio_caption_file) and os.path.exists(shot_plan_output_path):
@@ -477,6 +518,7 @@ w
             max_workers = getattr(config, "PARALLEL_SHOT_MAX_WORKERS", 4)
             max_reruns = getattr(config, "PARALLEL_SHOT_MAX_RERUNS", 2)
             print(f"⚡ Parallel mode enabled (workers: {max_workers}, max_reruns: {max_reruns})")
+            editor_transcript_path = srt_with_characters if srt_has_entries(srt_with_characters) else srt_path if srt_has_entries(srt_path) else None
             orchestrator = ParallelShotOrchestrator(
                 video_caption_path=caption_file,
                 video_scene_path=scene_summaries_dir,
@@ -485,7 +527,7 @@ w
                 max_iterations=max_iterations,
                 video_path=Video_Path,
                 frame_folder_path=frames_dir,
-                transcript_path=srt_with_characters if os.path.exists(srt_with_characters) else srt_path,
+                transcript_path=editor_transcript_path,
                 max_workers=max_workers,
                 max_reruns=max_reruns,
             )
@@ -493,6 +535,7 @@ w
             print(f"✅ Parallel mode completed, selected {len(_results)} shots.")
         else:
             print("🚶 Sequential mode enabled (EditorCoreAgent.run).")
+            editor_transcript_path = srt_with_characters if srt_has_entries(srt_with_characters) else srt_path if srt_has_entries(srt_path) else None
             editor_agent = EditorCoreAgent(
                 video_caption_path=caption_file,
                 video_scene_path=scene_summaries_dir,
@@ -502,7 +545,7 @@ w
                 video_path=Video_Path,
                 video_reader=vr.get("video_reader") if isinstance(vr, dict) else vr,
                 frame_folder_path=frames_dir,
-                transcript_path=srt_with_characters if os.path.exists(srt_with_characters) else srt_path
+                transcript_path=editor_transcript_path
             )
             _messages = editor_agent.run(shot_plan_path=shot_plan_output_path)
 

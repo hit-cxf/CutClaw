@@ -2,6 +2,7 @@ import os
 import json
 import asyncio
 import litellm
+import math
 from typing import List, Dict, Optional, Tuple
 from src import config
 import copy
@@ -242,6 +243,13 @@ def _build_clip_request(task: Tuple[str, Dict]) -> Tuple[str, List[Dict], Tuple,
     send_messages[1]["content"] = SHOT_CAPTION_PROMPT.replace("TRANSCRIPT_PLACEHOLDER", transcript)
 
     # Encode images and inject into user message
+    max_frames = int(getattr(config, "VIDEO_CAPTION_MAX_FRAMES_PER_CLIP", 12) or 0)
+    if max_frames > 0 and len(arrays) > max_frames:
+        stride = max(1, math.ceil(len(arrays) / max_frames))
+        arrays = arrays[::stride]
+        if len(arrays) > max_frames:
+            arrays = arrays[:max_frames]
+
     _images_b64 = [array_to_base64(arr) for arr in arrays]
     processed_messages = []
     for msg in send_messages:
@@ -399,10 +407,10 @@ def process_video(
     pbar = tqdm(total=0, desc="Captioning clips")
     loop = asyncio.new_event_loop()
     try:
-        failed = loop.run_until_complete(_run_overlapped(clip_iter, pbar, timeout=30))
+        failed = loop.run_until_complete(_run_overlapped(clip_iter, pbar, timeout=120))
 
         # Retry failed clips (already have arrays in memory)
-        timeouts = [100, 100]
+        timeouts = [180, 240]
         for attempt, timeout in enumerate(timeouts):
             if not failed:
                 break

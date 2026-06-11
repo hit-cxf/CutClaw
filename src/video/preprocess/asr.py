@@ -61,6 +61,26 @@ def _parse_srt_content(srt_text: str) -> List[Dict[str, Any]]:
     return segments
 
 
+def _is_qwen_omni_model(model: str) -> bool:
+    """Return True for Qwen Omni models that require streaming audio calls."""
+    model_name = (model or "").split("/")[-1].lower()
+    return "qwen" in model_name and "omni" in model_name
+
+
+def _collect_litellm_stream_text(stream) -> str:
+    """Collect text deltas from a LiteLLM/OpenAI-compatible sync stream."""
+    chunks = []
+    for chunk in stream:
+        choices = getattr(chunk, "choices", None)
+        if not choices:
+            continue
+        delta = getattr(choices[0], "delta", None)
+        content = getattr(delta, "content", None) if delta is not None else None
+        if content:
+            chunks.append(content)
+    return "".join(chunks)
+
+
 
 
 def write_srt_from_sentence_info(
@@ -344,6 +364,7 @@ def _transcribe_litellm(
     import json
     import re
     import tempfile
+    from types import SimpleNamespace
     import litellm
     import soundfile as sf
 
@@ -399,7 +420,13 @@ def _transcribe_litellm(
 
         msg = [{"role": "user", "content": [
             {"type": "text", "text": prompt},
-            {"type": "image_url", "image_url": {"url": f"data:audio/mp3;base64,{audio_b64}"}},
+            {
+                "type": "input_audio",
+                "input_audio": {
+                    "data": f"data:audio/mp3;base64,{audio_b64}",
+                    "format": "mp3",
+                },
+            },
         ]}]
         return msg, segment_start_time, tmp_path
 
@@ -447,13 +474,33 @@ def _transcribe_litellm(
     )
     for batch_start in range(0, num_segments, batch_size):
         batch_indices = list(range(batch_start, min(batch_start + batch_size, num_segments)))
-        batch_messages = [all_messages[i] for i in batch_indices]
         print(f"[ASR/LiteLLM] Sending batch segments {batch_indices[0]+1}-{batch_indices[-1]+1}/{num_segments}...")
-        try:
-            responses = litellm.batch_completion(messages=batch_messages, **kwargs_base)
-        except Exception as e:
-            print(f"[ASR/LiteLLM] batch_completion error: {e}")
-            responses = [None] * len(batch_indices)
+        if _is_qwen_omni_model(model):
+            responses = []
+            for idx in batch_indices:
+                try:
+                    stream = litellm.completion(
+                        messages=all_messages[idx],
+                        **kwargs_base,
+                        modalities=["text"],
+                        stream=True,
+                        stream_options={"include_usage": True},
+                    )
+
+                    content = _collect_litellm_stream_text(stream)
+                    responses.append(SimpleNamespace(
+                        choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+                    ))
+                except Exception as e:
+                    print(f"[ASR/LiteLLM] qwen-omni stream error for segment {idx + 1}: {e}")
+                    responses.append(None)
+        else:
+            batch_messages = [all_messages[i] for i in batch_indices]
+            try:
+                responses = litellm.batch_completion(messages=batch_messages, **kwargs_base)
+            except Exception as e:
+                print(f"[ASR/LiteLLM] batch_completion error: {e}")
+                responses = [None] * len(batch_indices)
 
         for idx, resp in zip(batch_indices, responses):
             seg_idx, seg_start, _ = all_meta[idx]
@@ -510,6 +557,14 @@ def _transcribe_litellm(
     all_segments = list(all_segments)
 
     print(f"[ASR/LiteLLM] Transcription complete: {len(all_sentence_info)} segments")
+    if not all_sentence_info:
+        debug_hint = f" Check raw segment outputs under {debug_dir}." if debug_dir else ""
+        print(
+            "⚠️  [ASR/LiteLLM] No valid subtitle segments were parsed from the model response. "
+            "This usually means the audio contains no clear speech, the requested language is wrong, "
+            "or the model did not return strict SRT content."
+            f"{debug_hint}"
+        )
 
     return {
         "text": " ".join(full_text_parts),
@@ -694,9 +749,11 @@ def run_asr(
 
     final_srt_path = srt_path or (os.path.splitext(video_path)[0] + ".srt")
 
-    if os.path.exists(final_srt_path):
+    if os.path.exists(final_srt_path) and os.path.getsize(final_srt_path) > 0:
         print(f"[Skip] Found existing SRT: {final_srt_path}")
         return {"srt_path": final_srt_path}
+    if os.path.exists(final_srt_path):
+        print(f"[ASR] Existing SRT is empty, regenerating: {final_srt_path}")
 
     audio_wav_path = os.path.join(output_dir, "audio_16k_mono.mp3")
     print(f"[ASR] Extracting audio -> {audio_wav_path}")
@@ -722,6 +779,13 @@ def run_asr(
     )
 
     sentence_info = asr_output.get("sentence_info", [])
+    if not sentence_info:
+        print(
+            "⚠️  [ASR] No dialogue/subtitle entries were recognized. "
+            "The generated SRT will be empty. Possible causes: the video has no clear speech, "
+            "speech is too quiet or mixed with music, ASR_LANGUAGE is mismatched, or the cloud ASR "
+            "model/request failed to return valid SRT."
+        )
 
     # Offset timestamps for clipped audio
     if start_sec is not None and start_sec > 0:
@@ -756,4 +820,3 @@ def run_asr(
             pass
 
     return result
-

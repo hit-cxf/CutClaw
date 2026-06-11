@@ -128,6 +128,24 @@ def escape_ffmpeg_expr(expr: str) -> str:
     return expr.replace(',', r'\,')
 
 
+def ffmpeg_has_filter(filter_name: str) -> bool:
+    """Return True when the active ffmpeg binary supports a filter."""
+    try:
+        result = subprocess.run(
+            ['ffmpeg', '-hide_banner', '-filters'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return False
+    if result.returncode != 0:
+        return False
+    pattern = re.compile(rf"^\s*[.A-Z| ]{{3}}\s+{re.escape(filter_name)}\s+")
+    return any(pattern.search(line) for line in result.stdout.splitlines())
+
+
 def get_video_framerate(video_path: str) -> float:
     """Get video framerate using ffprobe."""
     try:
@@ -540,6 +558,19 @@ def render_video_ffmpeg(
     }
     dialogue_y_expr = _dialogue_y_map.get(dialogue_y_position, dialogue_y_position)
 
+    drawtext_available = ffmpeg_has_filter("drawtext")
+    if not drawtext_available:
+        has_text_overlay = show_labels or any(
+            clip.get('overlay_text') or clip.get('subtitle_lines')
+            for clip in clips
+        )
+        if has_text_overlay:
+            print(
+                "⚠️  ffmpeg filter 'drawtext' is not available. "
+                "Rendering without labels/subtitles/dialogue text overlays. "
+                "Install an ffmpeg build with libfreetype support to enable burned-in text."
+            )
+
     # Parse crop ratio if provided
     crop_w_ratio = None
     crop_h_ratio = None
@@ -567,9 +598,9 @@ def render_video_ffmpeg(
             duration = clip['duration']
             section_idx = clip.get('section_idx', 0)
             shot_idx = clip.get('shot_idx', 0)
-            show_labels_for_clip = clip.get('show_labels', show_labels)
-            overlay_text = clip.get('overlay_text')
-            subtitle_lines = clip.get('subtitle_lines') or []
+            show_labels_for_clip = clip.get('show_labels', show_labels) and drawtext_available
+            overlay_text = clip.get('overlay_text') if drawtext_available else None
+            subtitle_lines = (clip.get('subtitle_lines') or []) if drawtext_available else []
 
             ending_video_path = clip.get('video_path')
             if ending_video_path:
@@ -765,6 +796,7 @@ def render_video_ffmpeg(
                         f"box=1:boxcolor={dialogue_box_color}:boxborderw=12"
                     )
                 filter_chain.append(drawtext_filter)
+                video_filter = ",".join(filter_chain)
 
                 cmd = [
                     'ffmpeg',
@@ -1610,4 +1642,3 @@ def main():
 
 if __name__ == '__main__':
     exit(main())
-

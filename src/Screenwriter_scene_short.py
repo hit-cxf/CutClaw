@@ -28,6 +28,17 @@ class HookDialogueSelectionError(RuntimeError):
     """Raised when hook dialogue selection should fail the pipeline."""
 
 
+def _subtitle_has_entries(subtitle_path: str | None) -> bool:
+    """Return True only when a subtitle file exists and has parseable entries."""
+    if not subtitle_path or not os.path.exists(subtitle_path):
+        return False
+    try:
+        return bool(parse_srt_file(subtitle_path))
+    except Exception as exc:
+        print(f"⚠️  [Screenwriter] Failed to parse subtitle file {subtitle_path}: {exc}")
+        return False
+
+
 def _has_meaningful_value(value) -> bool:
     """Check whether a JSON field is present with usable content."""
     if value is None:
@@ -1036,7 +1047,7 @@ class Screenwriter:
                         f"⚠️  [Screenwriter] Existing shot plan is incomplete. "
                         f"Missing parts: {', '.join(missing_parts)}. Regenerating..."
                     )
-                elif self.subtitle_path and os.path.exists(self.subtitle_path) and not existing_output.get("hook_dialogue"):
+                elif _subtitle_has_entries(self.subtitle_path) and not existing_output.get("hook_dialogue"):
                     print(
                         f"⚠️  [Screenwriter] Existing shot plan is missing hook_dialogue. "
                         f"Retrying hook dialogue selection for {self.output_path}..."
@@ -1121,7 +1132,7 @@ class Screenwriter:
             )
         # Select hook dialogue
         hook_dialogue = None
-        if self.subtitle_path and os.path.exists(self.subtitle_path):
+        if _subtitle_has_entries(self.subtitle_path):
             partial_output = {
                 "video_structure": [{**structure_proposal, "shot_plan": shot_plan}]
             }
@@ -1133,6 +1144,8 @@ class Screenwriter:
                 main_character=self.main_character,
             )
         else:
+            if self.subtitle_path:
+                print(f"⚠️  [Screenwriter] No usable subtitle entries in {self.subtitle_path}; skipping hook dialogue.")
             hook_dialogue = None
 
         import datetime
