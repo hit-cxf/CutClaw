@@ -46,3 +46,6 @@ src/config_my.py
 asset/demo_compressed
 ProVideo
 CLAUDE.md
+
+# 忽略二次开发项目
+EditClaw/
