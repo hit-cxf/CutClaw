@@ -7,6 +7,7 @@ import gc
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Annotated as A
+import numpy as np
 from src.video.deconstruction.video_caption import (
     SYSTEM_PROMPT,
     messages as caption_messages,
@@ -18,6 +19,10 @@ from src import config
 from src.func_call_shema import as_json_schema
 from src.func_call_shema import doc as D
 from src.Reviewer import ReviewerAgent
+from src.video.preprocess.video_utils import (
+    get_cached_sampled_frame_paths,
+    load_cached_sampled_frames,
+)
 from src.prompt import (
     DENSE_CAPTION_PROMPT_FILM,
     EDITOR_SYSTEM_PROMPT,
@@ -119,6 +124,76 @@ def _compact_json_str_for_log(s: str, max_len: int = 500) -> str:
     if len(s) <= max_len:
         return s
     return s[:max_len] + f"... [truncated {len(s) - max_len} chars]"
+
+
+def _uniform_cap_indices(indices: list[int], max_frames: int) -> list[int]:
+    if max_frames <= 0 or len(indices) <= max_frames:
+        return indices
+    import math
+    stride = max(1, math.ceil(len(indices) / max_frames))
+    capped = indices[::stride]
+    if capped[-1] != indices[-1]:
+        capped.append(indices[-1])
+    if len(capped) > max_frames:
+        capped = capped[:max_frames - 1] + [indices[-1]]
+    return capped
+
+
+def _sampled_indices_for_time_range(
+    start_s: float,
+    end_s: float,
+    total_count: int,
+    sample_fps: float,
+    max_frames: int,
+) -> list[int]:
+    import math
+
+    if total_count <= 0 or sample_fps <= 0:
+        return []
+    start_idx = max(0, int(math.floor(start_s * sample_fps)))
+    end_idx = min(total_count - 1, int(math.ceil(end_s * sample_fps)))
+    if end_idx < start_idx:
+        end_idx = start_idx
+    indices = list(range(start_idx, end_idx + 1))
+    return _uniform_cap_indices(indices, max_frames)
+
+
+def _load_editor_cached_frames(
+    frame_folder_path: str,
+    start_s: float,
+    end_s: float,
+    target_short_side: int | None,
+    max_frames: int,
+) -> list[np.ndarray]:
+    if not frame_folder_path or not getattr(config, "VIDEO_FRAME_CACHE_ENABLED", False):
+        return []
+
+    cache_short_side = int(getattr(config, "VIDEO_FRAME_CACHE_RESOLUTION", 720) or 720)
+    cache_format = getattr(config, "VIDEO_FRAME_CACHE_FORMAT", "jpg")
+    sample_fps = float(getattr(config, "VIDEO_FPS", 2) or 2)
+    _, frame_paths = get_cached_sampled_frame_paths(
+        frames_dir=frame_folder_path,
+        target_fps=sample_fps,
+        short_side=cache_short_side,
+        image_format=cache_format,
+    )
+    if not frame_paths:
+        return []
+
+    sampled_indices = _sampled_indices_for_time_range(
+        start_s=start_s,
+        end_s=end_s,
+        total_count=len(frame_paths),
+        sample_fps=sample_fps,
+        max_frames=max_frames,
+    )
+    if not sampled_indices:
+        return []
+    return load_cached_sampled_frames(
+        frame_paths=frame_paths,
+        sampled_indices=sampled_indices,
+        target_short_side=target_short_side,
+    )
 
 
 def commit(
@@ -449,6 +524,7 @@ def review_clip(
 def fine_grained_shot_trimming(
     time_range: A[str, D("The time range to analyze ('HH:MM:SS to HH:MM:SS'). This tool will analyze the ENTIRE range and provide scene breakdowns within it.")],
     frame_path: A[str, D("The path to the video frames file.")] = "",
+    frame_folder_path: A[str, D("Directory containing the sampled-frame cache. Auto-injected when available.")] = "",
     transcript_path: A[str, D("Optional path to an .srt transcript file; subtitles in this range will be injected into the prompt.")] = "",
     original_shot_boundaries: A[list, D("List of original shot boundaries from source material. Auto-injected.")] = None,
 ) -> str:
@@ -572,6 +648,17 @@ def fine_grained_shot_trimming(
     # Extract frames from the video clip and encode as base64
     # Use native video fps by default (no fixed sampling fps override).
     def _extract_clip_frames(video_path, start_s, end_s, video_reader=None):
+        max_frames = int(getattr(config, 'CORE_MAX_FRAMES', getattr(config, 'TRIM_SHOT_MAX_FRAMES', 240)))
+        cached = _load_editor_cached_frames(
+            frame_folder_path=frame_folder_path,
+            start_s=start_s,
+            end_s=end_s,
+            target_short_side=getattr(config, "VIDEO_RESOLUTION", None),
+            max_frames=max_frames,
+        )
+        if cached:
+            return [array_to_base64(frame) for frame in cached]
+
         vr = _normalize_video_reader(video_reader)
         if vr is None:
             if not video_path:
@@ -587,17 +674,8 @@ def fine_grained_shot_trimming(
         indices = list(range(start_f, end_f + 1))
         # Safety cap to avoid provider limit: max data-uri per request (e.g., 250 on OpenAI).
         # Keep a margin for robustness.
-        max_frames = int(getattr(config, 'CORE_MAX_FRAMES', getattr(config, 'TRIM_SHOT_MAX_FRAMES', 240)))
         if max_frames > 0 and len(indices) > max_frames:
-            import math
-            stride = max(1, math.ceil(len(indices) / max_frames))
-            indices = indices[::stride]
-            # Ensure last frame is included so ending timestamp context is preserved.
-            if indices[-1] != end_f:
-                indices.append(end_f)
-            # Hard cap after end-frame append.
-            if len(indices) > max_frames:
-                indices = indices[:max_frames - 1] + [end_f]
+            indices = _uniform_cap_indices(indices, max_frames)
 
         if not indices:
             return []
@@ -1177,6 +1255,8 @@ class EditorCoreAgent:
                 )
                 return False
 
+            if self.frame_folder_path:
+                args["frame_folder_path"] = self.frame_folder_path
             if self.transcript_path:
                 args["transcript_path"] = self.transcript_path
 

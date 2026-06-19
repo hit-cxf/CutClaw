@@ -119,6 +119,74 @@ class PyAVVideoReader:
         return _NumpyFrame(self.get_batch([int(index)]).asnumpy()[0])
 
 
+def _save_sampled_frames_to_disk_pyav_streaming(
+    video_reader: PyAVVideoReader,
+    frame_indices: List[int],
+    frames_dir: str,
+    image_format: str = "jpg",
+    jpeg_quality: int = 95,
+) -> List[str]:
+    """Save sampled frames using one forward decode pass on the source video."""
+    file_ext = image_format.lower()
+    saved_paths: List[str] = []
+    quality = max(1, min(100, int(jpeg_quality)))
+
+    targets = [int(i) for i in frame_indices if int(i) >= 0]
+    if not targets:
+        return saved_paths
+
+    progress = tqdm(total=len(targets), desc="Saving frames", unit="frame")
+    try:
+        with av.open(video_reader.video_path) as container:
+            stream = container.streams.video[0]
+            target_pos = 0
+            current_target = targets[target_pos]
+
+            for frame_idx, frame in enumerate(container.decode(stream)):
+                if frame_idx < current_target:
+                    continue
+
+                if frame_idx > current_target:
+                    while target_pos < len(targets) and targets[target_pos] < frame_idx:
+                        target_pos += 1
+                        progress.update(1)
+                    if target_pos >= len(targets):
+                        break
+                    current_target = targets[target_pos]
+                    if frame_idx < current_target:
+                        continue
+
+                arr = frame.to_ndarray(format="rgb24")
+                arr = video_reader._resize_if_needed(arr)
+
+                while target_pos < len(targets) and targets[target_pos] == frame_idx:
+                    out_path = os.path.join(frames_dir, f"frame_{target_pos:06d}.{file_ext}")
+                    image = Image.fromarray(arr)
+                    if file_ext in {"jpg", "jpeg"}:
+                        image.save(out_path, quality=quality)
+                    else:
+                        image.save(out_path)
+                    saved_paths.append(out_path)
+                    target_pos += 1
+                    progress.update(1)
+                    if target_pos >= len(targets):
+                        break
+
+                if target_pos >= len(targets):
+                    break
+                current_target = targets[target_pos]
+    finally:
+        progress.close()
+
+    if len(saved_paths) != len(targets):
+        raise RuntimeError(
+            f"Expected to cache {len(targets)} sampled frames, "
+            f"but only saved {len(saved_paths)} from {video_reader.video_path}"
+        )
+
+    return saved_paths
+
+
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
@@ -238,12 +306,107 @@ def _create_decord_reader(
     return _make_reader(video_path, ctx, height=target_h, width=target_w)
 
 
+def _sampled_frame_cache_dir(
+    frames_dir: str,
+    target_fps: float,
+    short_side: int,
+    image_format: str,
+) -> str:
+    fps_str = str(int(target_fps)) if float(target_fps).is_integer() else str(target_fps).replace(".", "p")
+    return os.path.join(frames_dir, f"sampled_frames_{fps_str}fps_{int(short_side)}p_{image_format.lower()}")
+
+
+def _list_cached_frame_paths(
+    frames_dir: str,
+    image_format: str,
+    expected_count: Optional[int] = None,
+) -> List[str]:
+    if not os.path.isdir(frames_dir):
+        return []
+
+    suffixes = {f".{image_format.lower()}"}
+    if image_format.lower() == "jpg":
+        suffixes.add(".jpeg")
+
+    paths = sorted(
+        os.path.join(frames_dir, name)
+        for name in os.listdir(frames_dir)
+        if name.startswith("frame_") and os.path.splitext(name)[1].lower() in suffixes
+    )
+    if expected_count is not None and len(paths) != int(expected_count):
+        return []
+    return paths
+
+
+def get_cached_sampled_frame_paths(
+    frames_dir: str,
+    target_fps: float,
+    short_side: int,
+    image_format: str,
+    expected_count: Optional[int] = None,
+) -> tuple[Optional[str], List[str]]:
+    """Resolve sampled-frame cache directory + ordered frame paths for a known cache spec."""
+    frame_cache_dir = _sampled_frame_cache_dir(
+        frames_dir=frames_dir,
+        target_fps=target_fps,
+        short_side=short_side,
+        image_format=image_format,
+    )
+    frame_paths = _list_cached_frame_paths(
+        frame_cache_dir,
+        image_format=image_format,
+        expected_count=expected_count,
+    )
+    return frame_cache_dir, frame_paths
+
+
+def _resize_array_short_side(array: np.ndarray, target_short_side: Optional[int]) -> np.ndarray:
+    if not target_short_side or target_short_side <= 0:
+        return array
+
+    height, width = array.shape[:2]
+    current_short = min(height, width)
+    if current_short <= target_short_side:
+        return array
+
+    if height <= width:
+        target_h = int(target_short_side)
+        target_w = int(round(width * target_short_side / height / 2) * 2)
+    else:
+        target_w = int(target_short_side)
+        target_h = int(round(height * target_short_side / width / 2) * 2)
+
+    image = Image.fromarray(array)
+    image = image.resize((target_w, target_h), Image.Resampling.BILINEAR)
+    return np.asarray(image)
+
+
+def load_cached_sampled_frames(
+    frame_paths: List[str],
+    sampled_indices: List[int],
+    target_short_side: Optional[int] = None,
+) -> List[np.ndarray]:
+    arrays: List[np.ndarray] = []
+    for sampled_idx in sampled_indices:
+        if sampled_idx < 0 or sampled_idx >= len(frame_paths):
+            continue
+        frame_path = frame_paths[sampled_idx]
+        if not os.path.exists(frame_path):
+            continue
+        with Image.open(frame_path) as image:
+            rgb = image.convert("RGB")
+            arr = np.asarray(rgb)
+        arrays.append(_resize_array_short_side(arr, target_short_side))
+    return arrays
+
+
 def _save_sampled_frames_to_disk(
     video_reader: VideoReader,
     frame_indices: List[int],
     frames_dir: str,
     image_format: str = "jpg",
     jpeg_quality: int = 95,
+    batch_size: int = 128,
 ) -> List[str]:
     file_ext = image_format.lower()
     if file_ext not in {"jpg", "jpeg", "png"}:
@@ -258,18 +421,36 @@ def _save_sampled_frames_to_disk(
     if not frame_indices:
         return []
 
-    sampled = video_reader.get_batch(frame_indices).asnumpy()
+    if isinstance(video_reader, PyAVVideoReader):
+        return _save_sampled_frames_to_disk_pyav_streaming(
+            video_reader=video_reader,
+            frame_indices=frame_indices,
+            frames_dir=frames_dir,
+            image_format=image_format,
+            jpeg_quality=jpeg_quality,
+        )
+
     saved_paths: List[str] = []
     quality = max(1, min(100, int(jpeg_quality)))
+    batch_size = max(1, int(batch_size))
 
-    for i, frame in enumerate(tqdm(sampled, desc="Saving frames", unit="frame")):
-        out_path = os.path.join(frames_dir, f"frame_{i:06d}.{file_ext}")
-        image = Image.fromarray(frame)
-        if file_ext in {"jpg", "jpeg"}:
-            image.save(out_path, quality=quality)
-        else:
-            image.save(out_path)
-        saved_paths.append(out_path)
+    progress = tqdm(total=len(frame_indices), desc="Saving frames", unit="frame")
+    try:
+        for batch_start in range(0, len(frame_indices), batch_size):
+            batch_end = min(len(frame_indices), batch_start + batch_size)
+            sampled = video_reader.get_batch(frame_indices[batch_start:batch_end]).asnumpy()
+            for local_idx, frame in enumerate(sampled):
+                out_idx = batch_start + local_idx
+                out_path = os.path.join(frames_dir, f"frame_{out_idx:06d}.{file_ext}")
+                image = Image.fromarray(frame)
+                if file_ext in {"jpg", "jpeg"}:
+                    image.save(out_path, quality=quality)
+                else:
+                    image.save(out_path)
+                saved_paths.append(out_path)
+                progress.update(1)
+    finally:
+        progress.close()
 
     return saved_paths
 
@@ -373,6 +554,11 @@ def scenedetect_extract_and_detect(
     jpeg_quality: int = 95,
     max_minutes: Optional[float] = None,
     num_workers: int = 1,
+    cache_sampled_frames: bool = False,
+    cache_resolution: Optional[int] = None,
+    cache_image_format: str = "jpg",
+    cache_jpeg_quality: int = 80,
+    cache_batch_size: int = 128,
 ) -> dict:
     _ensure_dir(frames_dir)
 
@@ -436,7 +622,38 @@ def scenedetect_extract_and_detect(
         frame_indices = [idx for idx in frame_indices if idx < len(video_reader)]
 
     frame_paths: List[str] = []
-    if save_frames_to_disk:
+    frame_cache_dir: Optional[str] = None
+    if cache_sampled_frames:
+        cache_short_side = int(cache_resolution or target_resolution or 720)
+        frame_cache_dir = _sampled_frame_cache_dir(
+            frames_dir=frames_dir,
+            target_fps=target_fps,
+            short_side=cache_short_side,
+            image_format=cache_image_format,
+        )
+        frame_paths = _list_cached_frame_paths(
+            frame_cache_dir,
+            image_format=cache_image_format,
+            expected_count=len(frame_indices),
+        )
+        if frame_paths:
+            print(f"[SceneDetect] Reusing sampled frame cache: {frame_cache_dir} ({len(frame_paths)} frames)")
+        else:
+            print(
+                f"[SceneDetect] Building sampled frame cache in {frame_cache_dir} "
+                f"({len(frame_indices)} frames @ {target_fps}fps, <= {cache_short_side}p)"
+            )
+            cache_reader = _create_decord_reader(video_path, cache_short_side)
+            frame_paths = _save_sampled_frames_to_disk(
+                video_reader=cache_reader,
+                frame_indices=frame_indices,
+                frames_dir=frame_cache_dir,
+                image_format=cache_image_format,
+                jpeg_quality=cache_jpeg_quality,
+                batch_size=cache_batch_size,
+            )
+            del cache_reader
+    elif save_frames_to_disk:
         print(f"[SceneDetect] Saving sampled frames to disk in {frames_dir}")
         frame_paths = _save_sampled_frames_to_disk(
             video_reader=video_reader,
@@ -444,6 +661,7 @@ def scenedetect_extract_and_detect(
             frames_dir=frames_dir,
             image_format=image_format,
             jpeg_quality=jpeg_quality,
+            batch_size=cache_batch_size,
         )
 
     scenes: List[List[int]] = []
@@ -481,6 +699,7 @@ def scenedetect_extract_and_detect(
         "video_reader": video_reader,
         "frame_indices": frame_indices,
         "frame_paths": frame_paths,
+        "frame_cache_dir": frame_cache_dir,
         "save_frames_to_disk": bool(save_frames_to_disk),
         "shot_scenes_path": shot_scenes_path,
         "scenes": scenes,
@@ -501,6 +720,11 @@ def decode_video_to_frames(
     image_format: str = "jpg",
     jpeg_quality: int = 80,
     num_workers: int = 16,
+    cache_sampled_frames: bool = False,
+    cache_resolution: Optional[int] = None,
+    cache_image_format: str = "jpg",
+    cache_jpeg_quality: int = 80,
+    cache_batch_size: int = 128,
 ) -> Dict[str, Any]:
     fps = float(target_fps) if target_fps is not None else 2.0
     if fps <= 0:
@@ -524,4 +748,9 @@ def decode_video_to_frames(
         jpeg_quality=jpeg_quality,
         max_minutes=max_minutes,
         num_workers=num_workers,
+        cache_sampled_frames=cache_sampled_frames,
+        cache_resolution=cache_resolution,
+        cache_image_format=cache_image_format,
+        cache_jpeg_quality=cache_jpeg_quality,
+        cache_batch_size=cache_batch_size,
     )

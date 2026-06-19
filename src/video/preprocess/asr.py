@@ -478,6 +478,17 @@ def _transcribe_litellm(
         if _is_qwen_omni_model(model):
             responses = []
             for idx in batch_indices:
+                seg_idx, seg_start, _ = all_meta[idx]
+                seg_end = (
+                    all_meta[idx + 1][1]
+                    if idx < num_segments - 1
+                    else total_duration
+                )
+                print(
+                    f"[ASR/LiteLLM] Processing segment {idx + 1}/{num_segments} "
+                    f"({seg_start:.1f}s-{seg_end:.1f}s)...",
+                    flush=True,
+                )
                 try:
                     stream = litellm.completion(
                         messages=all_messages[idx],
@@ -488,6 +499,11 @@ def _transcribe_litellm(
                     )
 
                     content = _collect_litellm_stream_text(stream)
+                    print(
+                        f"[ASR/LiteLLM] Received segment {idx + 1}/{num_segments} "
+                        f"({len(content)} chars)",
+                        flush=True,
+                    )
                     responses.append(SimpleNamespace(
                         choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
                     ))
@@ -497,7 +513,24 @@ def _transcribe_litellm(
         else:
             batch_messages = [all_messages[i] for i in batch_indices]
             try:
+                for idx in batch_indices:
+                    seg_idx, seg_start, _ = all_meta[idx]
+                    seg_end = (
+                        all_meta[idx + 1][1]
+                        if idx < num_segments - 1
+                        else total_duration
+                    )
+                    print(
+                        f"[ASR/LiteLLM] Queued segment {idx + 1}/{num_segments} "
+                        f"({seg_start:.1f}s-{seg_end:.1f}s)",
+                        flush=True,
+                    )
                 responses = litellm.batch_completion(messages=batch_messages, **kwargs_base)
+                print(
+                    f"[ASR/LiteLLM] Received batch segments "
+                    f"{batch_indices[0]+1}-{batch_indices[-1]+1}/{num_segments}",
+                    flush=True,
+                )
             except Exception as e:
                 print(f"[ASR/LiteLLM] batch_completion error: {e}")
                 responses = [None] * len(batch_indices)
@@ -511,6 +544,11 @@ def _transcribe_litellm(
                 content = None
             parsed = _parse_response(content, seg_idx, seg_start)
             all_results[idx] = {"segment_idx": seg_idx, "results": parsed}
+            print(
+                f"[ASR/LiteLLM] Parsed segment {seg_idx + 1}/{num_segments}: "
+                f"{len(parsed)} subtitle entries",
+                flush=True,
+            )
 
             # Save per-segment SRT with absolute timestamps for debugging
             if debug_dir:

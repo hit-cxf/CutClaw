@@ -3,10 +3,13 @@ import json
 import asyncio
 import litellm
 import math
+import threading
+import traceback
 from typing import List, Dict, Optional, Tuple
 from src import config
 import copy
 from tqdm import tqdm
+from src.video.preprocess.video_utils import load_cached_sampled_frames
 
 # Import scene merge functions
 from .scene_merge import OptimizedSceneSegmenter, load_shots, save_scenes
@@ -32,6 +35,22 @@ messages = [
 ]
 
 SYSTEM_PROMPT = "You are a helpful assistant."
+
+
+def _select_caption_sampled_indices(valid_indices: List[int]) -> List[int]:
+    """Select only the sampled-frame positions that will actually be sent to the VLM."""
+    if not valid_indices:
+        return []
+
+    max_frames = int(getattr(config, "VIDEO_CAPTION_MAX_FRAMES_PER_CLIP", 12) or 0)
+    if max_frames <= 0 or len(valid_indices) <= max_frames:
+        return valid_indices
+
+    stride = max(1, math.ceil(len(valid_indices) / max_frames))
+    selected = valid_indices[::stride]
+    if len(selected) > max_frames:
+        selected = selected[:max_frames]
+    return selected
 
 
 
@@ -121,6 +140,7 @@ def _iter_clip_frames(
     clip_secs: int,
     subtitle_file_path: str = None,
     caption_ckpt_folder: str = None,
+    frame_paths: Optional[List[str]] = None,
 ):
     """
     Generator version of gather_clip_frames_from_long_shots.
@@ -212,9 +232,18 @@ def _iter_clip_frames(
         if not valid_indices:
             continue
 
-        orig_indices = [frame_indices[idx] for idx in valid_indices]
-        chunk_frames = video_reader.get_batch(orig_indices).asnumpy()
-        arrays = list(chunk_frames)
+        selected_indices = _select_caption_sampled_indices(valid_indices)
+        arrays: List = []
+        if frame_paths and len(frame_paths) == sampled_count:
+            arrays = load_cached_sampled_frames(
+                frame_paths=frame_paths,
+                sampled_indices=selected_indices,
+                target_short_side=int(getattr(config, "VIDEO_RESOLUTION", 0) or 0),
+            )
+        if not arrays:
+            orig_indices = [frame_indices[idx] for idx in selected_indices]
+            chunk_frames = video_reader.get_batch(orig_indices).asnumpy()
+            arrays = list(chunk_frames)
 
         clip_data = {
             "arrays": arrays,
@@ -280,6 +309,14 @@ def _save_caption_result(
     """Parse model response and save to disk. Returns error string or None on success."""
     timestamp_parts = timestamp.split("_scene")[0] if "_scene" in timestamp else timestamp
     json_data = parse_json_safely(resp_content)
+    if json_data and not isinstance(json_data, dict):
+        level = "❌" if is_last_attempt else "⚠️ "
+        print(
+            f"{level} [VideoCaption] JSON Root Type Error in {timestamp_parts}: "
+            f"expected object, got {type(json_data).__name__}"
+        )
+        return f"JSON Root Type Error in {timestamp_parts}.json"
+
     if json_data:
         json_data["duration"] = {"clip_start_time": clip_start_time, "clip_end_time": clip_end_time}
         json_data["frame_range"] = frame_range
@@ -315,6 +352,7 @@ def process_video(
 
     video_reader = video["video_reader"]
     frame_indices = video["frame_indices"]
+    frame_paths = video.get("frame_paths") or []
 
     # Resolve shot_scenes path
     if long_shots_path is None:
@@ -353,49 +391,81 @@ def process_video(
 
     async def _run_overlapped(clip_iter, pbar, timeout, is_last_attempt=False):
         """
-        Producer-consumer: read frames synchronously, caption concurrently.
-        decord VideoReader is not thread-safe, so get_batch is called directly
-        in the event loop thread (blocks briefly per clip, but safe).
+        Producer-consumer: read frames on one dedicated thread and caption clips
+        concurrently on the asyncio event loop.
+
+        Decord VideoReader access stays single-threaded inside the producer, while
+        slow random seeks no longer block HTTP response handling for in-flight API
+        calls.
         """
         semaphore = asyncio.Semaphore(CONCURRENCY)
         failed_clips = []
-        pending_tasks = set()
+        queue_size = max(1, CONCURRENCY * 2)
+        queue = asyncio.Queue(maxsize=queue_size)
+        sentinel = object()
+        loop = asyncio.get_running_loop()
+        producer_errors = []
 
-        def _next_clip():
-            return next(clip_iter, None)
+        def _producer():
+            try:
+                for clip in clip_iter:
+                    future = asyncio.run_coroutine_threadsafe(queue.put(clip), loop)
+                    future.result()
+            except Exception as exc:
+                producer_errors.append(exc)
+            finally:
+                for _ in range(CONCURRENCY):
+                    future = asyncio.run_coroutine_threadsafe(queue.put(sentinel), loop)
+                    future.result()
 
-        while True:
-            # decord VideoReader is not thread-safe; call get_batch directly (blocks briefly but safe)
-            clip = _next_clip()
-            if clip is None:
-                break
-            pbar.total += 1
-            pbar.refresh()
-            task = asyncio.create_task(_caption_one(clip, semaphore, timeout, is_last_attempt=is_last_attempt))
-            pending_tasks.add(task)
-            await asyncio.sleep(0)  # yield to event loop so caption tasks can start
+        async def _consumer():
+            while True:
+                clip = await queue.get()
+                try:
+                    if clip is sentinel:
+                        return
 
-            # Drain completed tasks to avoid unbounded accumulation
-            done = {t for t in pending_tasks if t.done()}
-            for t in done:
-                pending_tasks.discard(t)
-                clip_r, meta, content = t.result()
-                ts, _, fr, cst, cet = meta
-                err = _save_caption_result(ts, content, fr, cst, cet, caption_ckpt_folder, clip_info=clip_r[1], is_last_attempt=is_last_attempt)
-                if err is not None:
-                    failed_clips.append(clip_r)
-                else:
-                    pbar.update(1)
+                    pbar.total += 1
+                    pbar.refresh()
 
-        # Wait for remaining tasks
-        for t in asyncio.as_completed(pending_tasks):
-            clip_r, meta, content = await t
-            ts, _, fr, cst, cet = meta
-            err = _save_caption_result(ts, content, fr, cst, cet, caption_ckpt_folder, clip_info=clip_r[1], is_last_attempt=is_last_attempt)
-            if err is not None:
-                failed_clips.append(clip_r)
-            else:
-                pbar.update(1)
+                    clip_r, meta, content = await _caption_one(
+                        clip,
+                        semaphore,
+                        timeout,
+                        is_last_attempt=is_last_attempt,
+                    )
+                    ts, _, fr, cst, cet = meta
+                    err = _save_caption_result(
+                        ts,
+                        content,
+                        fr,
+                        cst,
+                        cet,
+                        caption_ckpt_folder,
+                        clip_info=clip_r[1],
+                        is_last_attempt=is_last_attempt,
+                    )
+                    if err is not None:
+                        failed_clips.append(clip_r)
+                    else:
+                        pbar.update(1)
+                except Exception:
+                    clip_name = clip[0] if isinstance(clip, tuple) and clip else "<unknown>"
+                    print(f"❌ [VideoCaption] Consumer error while processing {clip_name}:")
+                    traceback.print_exc()
+                    raise
+                finally:
+                    queue.task_done()
+
+        producer = threading.Thread(target=_producer, name="video-caption-frame-reader", daemon=True)
+        producer.start()
+        consumers = [asyncio.create_task(_consumer()) for _ in range(CONCURRENCY)]
+
+        await asyncio.gather(*consumers)
+        producer.join()
+
+        if producer_errors:
+            raise producer_errors[0]
 
         return failed_clips
 
@@ -403,6 +473,7 @@ def process_video(
     clip_iter = _iter_clip_frames(
         video_reader, frame_indices, long_shots_path, config.CLIP_SECS, subtitle_file_path,
         caption_ckpt_folder=caption_ckpt_folder,
+        frame_paths=frame_paths,
     )
     pbar = tqdm(total=0, desc="Captioning clips")
     loop = asyncio.new_event_loop()
@@ -415,8 +486,6 @@ def process_video(
             if not failed:
                 break
             print(f"  🔄 [VideoCaption] {len(failed)} clips failed, retrying... ({attempt + 1}/{len(timeouts)})")
-            pbar.total += len(failed)
-            pbar.refresh()
             is_last = (attempt == len(timeouts) - 1)
             failed = loop.run_until_complete(_run_overlapped(iter(failed), pbar, timeout=timeout, is_last_attempt=is_last))
     finally:

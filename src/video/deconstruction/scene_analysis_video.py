@@ -7,6 +7,8 @@ import sys
 import json
 import re
 import asyncio
+import threading
+import traceback
 from typing import List, Dict, Optional
 
 import litellm
@@ -17,6 +19,7 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from src import config
 from src.prompt import SCENE_VIDEO_CAPTION_PROMPT, VLOG_SCENE_CAPTION_PROMPT
+from src.video.preprocess.video_utils import load_cached_sampled_frames
 from src.utils.media_utils import (
     parse_json_safely,
     parse_srt_file,
@@ -45,6 +48,7 @@ def _is_valid_scene_analysis_output(output_path: str) -> bool:
 
 
 def load_scene_frames_from_vr(video_reader, frame_indices: List[int], frame_range: List[int],
+                               frame_paths: Optional[List[str]] = None,
                                max_frames: int = None,
                                min_frames: int = None) -> List[Image.Image]:
     """
@@ -74,6 +78,15 @@ def load_scene_frames_from_vr(video_reader, frame_indices: List[int], frame_rang
     else:
         step = total_scene_frames / num_samples
         sampled_scene_indices = [scene_sampled[int(i * step)] for i in range(num_samples)]
+
+    if frame_paths and len(frame_paths) == len(frame_indices):
+        arrays = load_cached_sampled_frames(
+            frame_paths=frame_paths,
+            sampled_indices=sampled_scene_indices,
+            target_short_side=int(getattr(config, "VIDEO_RESOLUTION", 0) or 0),
+        )
+        if arrays:
+            return [Image.fromarray(arr) for arr in arrays]
 
     # 将采样帧空间索引映射到原始视频帧索引
     orig_indices = [frame_indices[i] for i in sampled_scene_indices if i < len(frame_indices)]
@@ -115,6 +128,7 @@ class SceneVideoAnalyzer:
         """
         self.video_reader = vr["video_reader"]
         self.frame_indices = vr["frame_indices"]
+        self.frame_paths = vr.get("frame_paths") or []
         self.subtitles = parse_srt_file(subtitle_file) if subtitle_file else []
         if self.subtitles:
             print(f"✅ [SceneAnalysis] Loaded {len(self.subtitles)} subtitle entries")
@@ -226,7 +240,7 @@ class SceneVideoAnalyzer:
             frame_range = [scene_data['start_frame'], scene_data['end_frame']]
         else:
             frame_range = [0, 0]
-        return load_scene_frames_from_vr(self.video_reader, self.frame_indices, frame_range)
+        return load_scene_frames_from_vr(self.video_reader, self.frame_indices, frame_range, frame_paths=self.frame_paths)
 
     async def process_scene(self, scene_data: Dict, frames: List = None) -> Dict:
         """处理单个场景，frames 可由外部预先读取以避免阻塞 event loop"""
@@ -239,7 +253,7 @@ class SceneVideoAnalyzer:
 
         if frames is None:
             # fallback: 直接读帧（会阻塞 event loop，仅兼容旧调用）
-            frames = load_scene_frames_from_vr(self.video_reader, self.frame_indices, frame_range)
+            frames = load_scene_frames_from_vr(self.video_reader, self.frame_indices, frame_range, frame_paths=self.frame_paths)
         if not frames:
             return {"error": "No frames loaded"}
 
@@ -361,33 +375,71 @@ class SceneVideoAnalyzer:
         async def _run_all(task_list, pbar):
             semaphore = asyncio.Semaphore(max_workers)
             failed_tasks = []
-            pending = set()
+            queue_size = max(1, max_workers * 2)
+            queue = asyncio.Queue(maxsize=queue_size)
+            sentinel = object()
+            loop = asyncio.get_running_loop()
+            producer_errors = []
 
-            for in_path, out_path in task_list:
-                # 同步读 json + 读帧（decord not thread-safe，必须在 event loop 主线程）
-                with open(in_path, 'r', encoding='utf-8') as f:
-                    scene_data = json.load(f)
-                frames = self.load_scene_frames(scene_data)
+            def _producer():
+                try:
+                    for in_path, out_path in task_list:
+                        with open(in_path, 'r', encoding='utf-8') as f:
+                            scene_data = json.load(f)
+                        frames = self.load_scene_frames(scene_data)
+                        future = asyncio.run_coroutine_threadsafe(
+                            queue.put((in_path, out_path, scene_data, frames)),
+                            loop,
+                        )
+                        future.result()
+                except Exception as exc:
+                    producer_errors.append(exc)
+                finally:
+                    for _ in range(max_workers):
+                        future = asyncio.run_coroutine_threadsafe(queue.put(sentinel), loop)
+                        future.result()
 
-                task = asyncio.create_task(_caption_one(in_path, out_path, scene_data, frames, semaphore))
-                task._scene_key = (in_path, out_path)
-                pending.add(task)
-                await asyncio.sleep(0)  # yield to event loop so caption tasks can start
+            async def _consumer():
+                while True:
+                    item = await queue.get()
+                    try:
+                        if item is sentinel:
+                            return
 
-                # drain completed
-                done = {t for t in pending if t.done()}
-                for t in done:
-                    pending.discard(t)
-                    result = t.result()
-                    if result == "Success":
-                        pbar.update(1)
-                    else:
-                        failed_tasks.append(t._scene_key)
+                        in_path, out_path, scene_data, frames = item
+                        result = await _caption_one(
+                            in_path,
+                            out_path,
+                            scene_data,
+                            frames,
+                            semaphore,
+                        )
+                        if result == "Success":
+                            pbar.update(1)
+                        else:
+                            failed_tasks.append((in_path, out_path))
+                    except Exception:
+                        scene_name = os.path.basename(item[0]) if isinstance(item, tuple) and item else "<unknown>"
+                        print(f"❌ [SceneAnalysis] Consumer error while processing {scene_name}:")
+                        traceback.print_exc()
+                        raise
+                    finally:
+                        queue.task_done()
 
-            for coro in asyncio.as_completed(pending):
-                result = await coro
-                if result == "Success":
-                    pbar.update(1)
+            producer = threading.Thread(
+                target=_producer,
+                name="scene-analysis-frame-reader",
+                daemon=True,
+            )
+            producer.start()
+            consumers = [asyncio.create_task(_consumer()) for _ in range(max_workers)]
+
+            await asyncio.gather(*consumers)
+            producer.join()
+
+            if producer_errors:
+                raise producer_errors[0]
+
             return failed_tasks
 
         pending_tasks = list(tasks)

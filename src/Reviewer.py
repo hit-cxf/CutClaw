@@ -14,7 +14,11 @@ from src.utils.time_format_convert import hhmmss_to_seconds, seconds_to_hhmmss
 from src import config
 from src.prompt import VLM_AESTHETIC_ANALYSIS_PROMPT, VLM_PROTAGONIST_DETECTION_PROMPT
 from src.func_call_shema import doc as D
-from src.video.preprocess.video_utils import _create_decord_reader
+from src.video.preprocess.video_utils import (
+    _create_decord_reader,
+    get_cached_sampled_frame_paths,
+    load_cached_sampled_frames,
+)
 
 class StopException(Exception):
     """
@@ -263,6 +267,48 @@ class ReviewerAgent:
         _clear_thread_video_reader()
         gc.collect()
 
+    def _load_cached_frames_for_range(
+        self,
+        start_sec: float,
+        end_sec: float,
+        max_frames: int,
+    ) -> list[tuple[int, np.ndarray]]:
+        if not self.frame_folder_path or not getattr(config, "VIDEO_FRAME_CACHE_ENABLED", False):
+            return []
+
+        sample_fps = float(getattr(config, "VIDEO_FPS", 2) or 2)
+        cache_short_side = int(getattr(config, "VIDEO_FRAME_CACHE_RESOLUTION", 720) or 720)
+        cache_format = getattr(config, "VIDEO_FRAME_CACHE_FORMAT", "jpg")
+        _, frame_paths = get_cached_sampled_frame_paths(
+            frames_dir=self.frame_folder_path,
+            target_fps=sample_fps,
+            short_side=cache_short_side,
+            image_format=cache_format,
+        )
+        if not frame_paths:
+            return []
+
+        start_idx = max(0, int(np.floor(start_sec * sample_fps)))
+        end_idx = min(len(frame_paths) - 1, int(np.ceil(end_sec * sample_fps)))
+        if end_idx < start_idx:
+            end_idx = start_idx
+
+        sampled_indices = list(range(start_idx, end_idx + 1))
+        if max_frames > 0 and len(sampled_indices) > max_frames:
+            stride = max(1, int(np.ceil(len(sampled_indices) / max_frames)))
+            sampled_indices = sampled_indices[::stride]
+            if sampled_indices[-1] != end_idx:
+                sampled_indices.append(end_idx)
+            if len(sampled_indices) > max_frames:
+                sampled_indices = sampled_indices[:max_frames - 1] + [end_idx]
+
+        arrays = load_cached_sampled_frames(
+            frame_paths=frame_paths,
+            sampled_indices=sampled_indices,
+            target_short_side=getattr(config, "VIDEO_RESOLUTION", None),
+        )
+        return list(zip(sampled_indices[:len(arrays)], arrays))
+
     def _compute_frame_indices(self, start_sec: float, end_sec: float, fps: float, max_frames: Optional[int] = None) -> list:
         """Compute frame indices for a time range using native fps with a hard cap."""
         if fps <= 0:
@@ -365,19 +411,31 @@ class ReviewerAgent:
             verbose_frame_log = bool(getattr(config, "VLM_FACE_LOG_EACH_FRAME", False))
 
             max_frames = int(getattr(config, "CORE_MAX_FRAMES", getattr(config, "TRIM_SHOT_MAX_FRAMES", 240)))
-            vr = _get_thread_video_reader(video_path)
-            if vr is None:
-                return "❌ Error: Unable to initialize video reader."
-            video_fps = float(vr.get_avg_fps())
-            frame_indices = self._compute_frame_indices(start_sec, end_sec, video_fps, max_frames=max_frames)
-            if not frame_indices:
-                return f"❌ Error: No frames to process in the specified time range."
+            cached_frame_items = self._load_cached_frames_for_range(
+                start_sec=start_sec,
+                end_sec=end_sec,
+                max_frames=max_frames,
+            )
+            if cached_frame_items:
+                sample_fps = float(getattr(config, "VIDEO_FPS", 2) or 2)
+                video_fps = sample_fps
+                if verbose_frame_log:
+                    print(f"🎞️  [Reviewer: VLM] Using sampled frame cache; processing {len(cached_frame_items)} frames...")
+                frame_items = cached_frame_items
+            else:
+                vr = _get_thread_video_reader(video_path)
+                if vr is None:
+                    return "❌ Error: Unable to initialize video reader."
+                video_fps = float(vr.get_avg_fps())
+                frame_indices = self._compute_frame_indices(start_sec, end_sec, video_fps, max_frames=max_frames)
+                if not frame_indices:
+                    return f"❌ Error: No frames to process in the specified time range."
 
-            if verbose_frame_log:
-                print(f"🎞️  [Reviewer: VLM] Decoding video; processing {len(frame_indices)} frames...")
+                if verbose_frame_log:
+                    print(f"🎞️  [Reviewer: VLM] Decoding video; processing {len(frame_indices)} frames...")
 
-            frames = vr.get_batch(frame_indices).asnumpy()
-            frame_items = list(zip(frame_indices, frames))
+                frames = vr.get_batch(frame_indices).asnumpy()
+                frame_items = list(zip(frame_indices, frames))
             batch_size = int(getattr(config, "VLM_FACE_BATCH_SIZE", 8))
             batch_concurrency = int(getattr(config, "VLM_FACE_BATCH_CONCURRENCY", 16))
 

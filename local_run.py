@@ -197,6 +197,11 @@ def main():
         save_frames_to_disk=getattr(config, 'VIDEO_SAVE_DEBUG_FRAMES', False),
         image_format='jpg',
         jpeg_quality=80,
+        cache_sampled_frames=getattr(config, 'VIDEO_FRAME_CACHE_ENABLED', False),
+        cache_resolution=getattr(config, 'VIDEO_FRAME_CACHE_RESOLUTION', 720),
+        cache_image_format=getattr(config, 'VIDEO_FRAME_CACHE_FORMAT', 'jpg'),
+        cache_jpeg_quality=getattr(config, 'VIDEO_FRAME_CACHE_JPEG_QUALITY', 80),
+        cache_batch_size=getattr(config, 'VIDEO_FRAME_CACHE_BATCH_SIZE', 128),
     )
     stage_times['shot_detection'] = time.time() - t0
     print(f"✅ [Step 1] Shot detection completed in {stage_times['shot_detection']:.1f}s")

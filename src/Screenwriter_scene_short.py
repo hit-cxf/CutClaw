@@ -99,7 +99,8 @@ def _call_agent_litellm(messages: list, max_tokens: int = None) -> str | None:
         messages=messages,
         max_tokens=max_tokens or config.AGENT_MODEL_MAX_TOKEN,
         api_key=config.AGENT_LITELLM_API_KEY,
-        timeout=60,
+        timeout=getattr(config, "AGENT_LITELLM_TIMEOUT", 120),
+        response_format={"type": "json_object"},
     )
     if config.AGENT_LITELLM_URL:
         kwargs["api_base"] = config.AGENT_LITELLM_URL
@@ -123,6 +124,10 @@ def _call_agent_litellm(messages: list, max_tokens: int = None) -> str | None:
             return merged or None
         return str(content).strip() or None
     except Exception as e:
+        print(
+            f"❌ [Screenwriter] Agent LLM call failed: "
+            f"{type(e).__name__}: {e}"
+        )
         return None
 
 
@@ -142,6 +147,18 @@ def _seconds_to_mmss(seconds: float) -> str:
     mm = total_secs // 60
     ss = total_secs % 60
     return f"{mm}:{ss:02d}.{tenths}"
+
+
+def _format_audio_time(seconds: float, template_value=None) -> str:
+    """Preserve HH:MM:SS formatting when the source uses it, otherwise emit MM:SS.f."""
+    if isinstance(template_value, str) and template_value.count(":") >= 2:
+        total_ms = max(0, int(round(seconds * 1000)))
+        hh = total_ms // 3600000
+        mm = (total_ms % 3600000) // 60000
+        ss = (total_ms % 60000) // 1000
+        ms = total_ms % 1000
+        return f"{hh:02d}:{mm:02d}:{ss:02d}.{ms // 100}"
+    return _seconds_to_mmss(seconds)
 
 
 def _parse_audio_segment_selection_response(content: str) -> dict | None:
@@ -190,12 +207,35 @@ def select_audio_segment(audio_db: dict, instruction: str) -> tuple[str, str]:
         sec = sections[idx]
         sec_start = _to_audio_seconds(sec.get('Start_Time', 0))
         sec_end = _to_audio_seconds(sec.get('End_Time', 0))
-        sec_dur = max(0.0, sec_end - sec_start)
-        if min_dur <= sec_dur <= max_dur:
-            return str(sec.get('Start_Time', _seconds_to_mmss(sec_start))), str(sec.get('End_Time', _seconds_to_mmss(sec_end)))
-        # Trim from section start to target_dur, but never exceed section end
-        trim_end = min(sec_start + target_dur, sec_end)
-        return _seconds_to_mmss(sec_start), _seconds_to_mmss(trim_end)
+
+        # Prefer extending forward across adjacent music sections so the final
+        # audio span can actually honor the requested output duration.
+        target_end = sec_start + target_dur
+        extended_end = sec_end
+        look_ahead_idx = idx + 1
+        while extended_end < target_end and look_ahead_idx < len(sections):
+            next_sec = sections[look_ahead_idx]
+            next_start = _to_audio_seconds(next_sec.get('Start_Time', extended_end))
+            next_end = _to_audio_seconds(next_sec.get('End_Time', next_start))
+            if next_end <= extended_end:
+                look_ahead_idx += 1
+                continue
+            # Allow a small gap between adjacent top-level music sections.
+            if next_start - extended_end > 1.0:
+                break
+            extended_end = next_end
+            look_ahead_idx += 1
+
+        final_end = min(sec_start + max_dur, extended_end)
+        if final_end - sec_start < min_dur:
+            final_end = extended_end
+        if final_end - sec_start > max_dur:
+            final_end = sec_start + max_dur
+
+        return (
+            _format_audio_time(sec_start, sec.get('Start_Time')),
+            _format_audio_time(final_end, sec.get('End_Time')),
+        )
 
     feedback = None
     for attempt in range(1, config.AUDIO_SEGMENT_SELECTION_MAX_RETRIES + 1):
@@ -288,6 +328,71 @@ def filter_sub_segments_by_range(
             result[i]['End_Time'] = result[i + 1]['Start_Time']
 
     return result
+
+
+def merge_short_audio_sub_segments(
+    sub_segments: list,
+    min_duration: float,
+) -> list:
+    """Merge adjacent audio sub-segments so every generated shot has a usable minimum duration."""
+    if not sub_segments:
+        return []
+
+    merged: list[dict] = []
+    current = dict(sub_segments[0])
+
+    def _seg_start(seg: dict) -> float:
+        return float(seg.get('Start_Time', 0.0))
+
+    def _seg_end(seg: dict) -> float:
+        return float(seg.get('End_Time', 0.0))
+
+    def _duration(seg: dict) -> float:
+        return max(0.0, _seg_end(seg) - _seg_start(seg))
+
+    def _merge_into(base: dict, nxt: dict) -> dict:
+        combined = dict(base)
+        combined['End_Time'] = max(_seg_end(base), _seg_end(nxt))
+        base_name = str(base.get('name', '')).strip()
+        next_name = str(nxt.get('name', '')).strip()
+        if base_name and next_name and next_name != base_name:
+            combined['name'] = f"{base_name} + {next_name}"
+        elif next_name:
+            combined['name'] = next_name
+
+        base_desc = str(base.get('description', '')).strip()
+        next_desc = str(nxt.get('description', '')).strip()
+        if base_desc and next_desc and next_desc not in base_desc:
+            combined['description'] = f"{base_desc} / {next_desc}"
+        elif next_desc:
+            combined['description'] = next_desc
+        return combined
+
+    for nxt in sub_segments[1:]:
+        if _duration(current) < min_duration:
+            current = _merge_into(current, nxt)
+            continue
+        merged.append(current)
+        current = dict(nxt)
+
+    merged.append(current)
+
+    if len(merged) >= 2 and _duration(merged[-1]) < min_duration:
+        merged[-2] = _merge_into(merged[-2], merged[-1])
+        merged.pop()
+
+    return merged
+
+
+def derive_hook_target_duration(total_duration_sec: float) -> float:
+    """Keep the spoken hook punchy relative to the final edit duration."""
+    total_duration_sec = max(0.0, float(total_duration_sec))
+    ratio = float(getattr(config, "HOOK_DIALOGUE_TARGET_RATIO", 0.20))
+    min_sec = float(getattr(config, "HOOK_DIALOGUE_MIN_DURATION_SEC", 3.0))
+    max_sec = float(getattr(config, "HOOK_DIALOGUE_MAX_DURATION_SEC", 10.0))
+    if total_duration_sec <= 0:
+        return max_sec
+    return max(min_sec, min(max_sec, total_duration_sec * ratio))
 
 
 def check_scene_distribution(
@@ -575,6 +680,8 @@ def generate_shot_plan_with_retry(
             if is_valid:
                 return parsed_shot_plan
             last_error = f"invalid shot plan format: {reason}"
+
+        print(f"⚠️  [Screenwriter: Shot Plan] Attempt {attempt}/{retries} failed: {last_error}")
 
         if attempt < retries:
             wait_seconds = min(max_backoff, base_backoff * (2 ** (attempt - 1)))
@@ -1005,11 +1112,16 @@ def refresh_hook_dialogue_in_shot_plan(
             f"Cannot refresh hook dialogue because instruction is missing in {shot_plan_path}"
         )
 
+    section = (shot_plan_data.get("video_structure") or [{}])[0]
+    section_start = float(section.get("start_time", 0.0) or 0.0)
+    section_end = float(section.get("end_time", 0.0) or 0.0)
+    hook_target = derive_hook_target_duration(section_end - section_start)
+
     shot_plan_data["hook_dialogue"] = select_hook_dialogue(
         subtitle_path,
         shot_plan_data,
         instruction_to_use,
-        target_duration_sec=target_duration_sec,
+        target_duration_sec=hook_target if hook_target > 0 else target_duration_sec,
         main_character=main_character,
         prompt_window_mode=prompt_window_mode,
         random_window_attempts=random_window_attempts,
@@ -1088,6 +1200,10 @@ class Screenwriter:
         selected_sub_segments = filter_sub_segments_by_range(
             audio_sections, selected_start_str, selected_end_str
         )
+        selected_sub_segments = merge_short_audio_sub_segments(
+            selected_sub_segments,
+            min_duration=float(getattr(config, "MIN_ACCEPTABLE_SHOT_DURATION", 2.0)),
+        )
 
         def _to_sec(t):
             if isinstance(t, (int, float)):
@@ -1133,6 +1249,7 @@ class Screenwriter:
         # Select hook dialogue
         hook_dialogue = None
         if _subtitle_has_entries(self.subtitle_path):
+            hook_target_duration = derive_hook_target_duration(duration)
             partial_output = {
                 "video_structure": [{**structure_proposal, "shot_plan": shot_plan}]
             }
@@ -1140,7 +1257,7 @@ class Screenwriter:
                 self.subtitle_path,
                 partial_output,
                 instruction,
-                target_duration_sec=15.0,
+                target_duration_sec=hook_target_duration,
                 main_character=self.main_character,
             )
         else:

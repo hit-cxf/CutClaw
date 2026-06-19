@@ -41,9 +41,9 @@ _load_project_env()
 # ------------------ UI Remembered Inputs ------------------ #
 # These are saved automatically by the app when you change sidebar fields.
 
-VIDEO_PATH = "resource/video/5.mp4"
-AUDIO_PATH = "resource/audio/mixkit-beautiful-dream-493.mp3"
-INSTRUCTION = "做这个影片的精彩剪辑"
+VIDEO_PATH = "resource/video/[世界杯]E组第1轮：德国VS库拉索.mp4"
+AUDIO_PATH = "resource/audio/mixkit-sports-highlights-51.mp3"
+INSTRUCTION = "德国7:1大胜库拉索，做这场比赛所有进球的精彩剪辑"
 SRT_PATH = ""
 
 
@@ -75,6 +75,25 @@ VIDEO_MAX_FRAMES = None if VIDEO_MAX_MINUTES is None else int(VIDEO_MAX_MINUTES 
 VIDEO_SAVE_DEBUG_FRAMES = False
 # If True, sampled debug frames are written to disk for troubleshooting.
 # This increases disk I/O.
+
+VIDEO_FRAME_CACHE_ENABLED = True
+# If True, pre-extract all sampled frames to a reusable on-disk cache.
+# This greatly speeds up long-video random access in later VLM stages.
+
+VIDEO_FRAME_CACHE_RESOLUTION = 720
+# Maximum short-side resolution for cached sampled frames.
+# Frames are stored at up to this size, then optionally resized down before VLM.
+
+VIDEO_FRAME_CACHE_FORMAT = "jpg"
+# Disk format for sampled-frame cache. "jpg" is recommended for throughput/space.
+
+VIDEO_FRAME_CACHE_JPEG_QUALITY = 80
+# JPEG quality for the sampled-frame cache.
+# Lower values reduce disk usage; 75~85 is a good range for sports footage.
+
+VIDEO_FRAME_CACHE_BATCH_SIZE = 128
+# Number of sampled frames to decode and save per batch while building cache.
+# Keeps memory bounded for hours-long videos.
 
 
 # ------------------ Shot Detection ------------------ #
@@ -213,7 +232,7 @@ VIDEO_ANALYSIS_ENDPOINT = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 VIDEO_ANALYSIS_API_KEY = _env("VIDEO_ANALYSIS_API_KEY")
 # API key for the video analysis model.
 
-CAPTION_BATCH_SIZE = 4
+CAPTION_BATCH_SIZE = 8
 # Batch size for parallel clip captioning/analysis.
 
 SCENE_ANALYSIS_MIN_FRAMES = 6
@@ -352,12 +371,15 @@ AGENT_MODEL_MAX_TOKEN = 8192
 AGENT_MODEL_MAX_RETRIES = 4
 # Max retries per agent step when model calls fail.
 
+AGENT_LITELLM_TIMEOUT = 120
+# Timeout (seconds) for agent-model completion calls.
+
 AGENT_RATE_LIMIT_BACKOFF_BASE = 1.0
 AGENT_RATE_LIMIT_MAX_BACKOFF = 8.0
 # Backoff timing (seconds) when rate limits occur.
 
-AUDIO_SEGMENT_MIN_DURATION_SEC = 5.0
-AUDIO_SEGMENT_MAX_DURATION_SEC = 15.0
+AUDIO_SEGMENT_MIN_DURATION_SEC = 55.0
+AUDIO_SEGMENT_MAX_DURATION_SEC = 65.0
 # Allowed music-span duration range for short-video planning.
 
 AUDIO_SEGMENT_SELECTION_MAX_RETRIES = 3
@@ -411,7 +433,7 @@ FACE_QUALITY_CHECK_METHOD = "vlm"
 
 # ------------------ Protagonist Presence Constraints ------------------ #
 
-MAIN_CHARACTER_NAME = "林小舟"
+MAIN_CHARACTER_NAME = ""
 # Main character / target subject name (comma-separated for multiple roles).
 # This is one of the highest-impact parameters in object mode.
 

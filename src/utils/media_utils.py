@@ -365,14 +365,33 @@ def parse_structure_proposal_output(output: str) -> Optional[Dict]:
 
 
 def parse_shot_plan_output(output: str) -> Optional[Dict]:
-    """Parse shot plan JSON from LLM output, stripping markdown fences if present."""
+    """Parse shot plan JSON from LLM output with light recovery for mixed text."""
     if not output:
         return None
     text = output.strip()
     m = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE)
     if m:
         text = m.group(1).strip()
-    try:
-        return json.loads(text)
-    except Exception:
-        return None
+
+    candidates = [text]
+
+    json_start = min((i for i in (text.find("{"), text.find("[")) if i != -1), default=None)
+    if json_start is not None:
+        candidate = text[json_start:].strip()
+        if candidate not in candidates:
+            candidates.append(candidate)
+
+    brace_match = re.search(r"(\{.*\})", text, re.DOTALL)
+    if brace_match:
+        candidate = brace_match.group(1).strip()
+        if candidate not in candidates:
+            candidates.append(candidate)
+
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            continue
+    return None

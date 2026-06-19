@@ -387,6 +387,31 @@ with st.sidebar:
     if shot_length != _derive_target_shot_length_from_config():
         _persist_target_shot_length(shot_length)
 
+    hook_ratio_percent = st.number_input(
+        "Hook Ratio (%)",
+        min_value=0.0,
+        max_value=100.0,
+        value=float(_cfg("HOOK_DIALOGUE_TARGET_RATIO", "0.2")) * 100.0,
+        step=1.0,
+        help="Hook target duration as a percentage of the selected output length.",
+        key="si_hook_ratio_percent",
+    )
+    persisted_hook_ratio_percent = float(_cfg("HOOK_DIALOGUE_TARGET_RATIO", "0.2")) * 100.0
+    if hook_ratio_percent != persisted_hook_ratio_percent:
+        save_config("HOOK_DIALOGUE_TARGET_RATIO", str(hook_ratio_percent / 100.0))
+
+    hook_max_length = st.number_input(
+        "Hook Max Length (seconds)",
+        min_value=0.0,
+        max_value=30.0,
+        value=float(_cfg("HOOK_DIALOGUE_MAX_DURATION_SEC", "10.0")),
+        step=0.5,
+        help="Maximum allowed hook duration, even if the ratio would produce a longer hook.",
+        key="si_hook_max_length",
+    )
+    if hook_max_length != float(_cfg("HOOK_DIALOGUE_MAX_DURATION_SEC", "10.0")):
+        save_config("HOOK_DIALOGUE_MAX_DURATION_SEC", str(hook_max_length))
+
     with st.expander("⚙️ Model Settings", expanded=False):
         st.markdown("**1. Video Analysis Model (Vision)**")
         st.caption("Used for dense video captioning and scene understanding.")
