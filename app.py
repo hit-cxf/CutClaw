@@ -8,6 +8,7 @@ import threading
 import signal
 import queue
 import logging
+from datetime import datetime
 logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").setLevel(logging.ERROR)
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -251,6 +252,7 @@ _DEFAULTS = {
     "process": None,
     "log_lines": [],
     "log_queue": None,
+    "log_file_path": None,
     "result_shot_json": None,
     "pipeline_failed": False,
     "start_error": None,
@@ -482,6 +484,12 @@ def derive_shot_plan_path(video_path: str, audio_path: str, instruction: str) ->
     return derive_shot_point_path(video_path, audio_path, instruction).replace("shot_point_", "shot_plan_")
 
 
+def derive_backend_log_path(video_path: str, audio_path: str, instruction: str) -> str:
+    shot_point_path = derive_shot_point_path(video_path, audio_path, instruction)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return shot_point_path.replace("shot_point_", f"backend_log_{timestamp}_").replace(".json", ".log")
+
+
 def _resolve_path(path: str) -> str:
     if not path:
         return ""
@@ -537,12 +545,27 @@ def rerun_hook_dialogue_selection(
     return subtitle_path
 
 
-def _read_stdout(proc, q):
-    """Read process stdout line-by-line into queue. Sentinel None signals EOF."""
+def _read_stdout(proc, q, log_path: str | None = None, cmd: list[str] | None = None):
+    """Read process stdout line-by-line into queue and tee it to a log file."""
+    log_fp = None
     try:
+        if log_path:
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            log_fp = open(log_path, "w", encoding="utf-8", buffering=1)
+            log_fp.write(f"[CutClaw backend log] started_at={datetime.now().isoformat()}\n")
+            if cmd:
+                log_fp.write(f"[command] {' '.join(cmd)}\n")
+            log_fp.write("\n")
+
         for line in proc.stdout:
-            q.put(line.rstrip())
+            stripped = line.rstrip()
+            if log_fp:
+                log_fp.write(stripped + "\n")
+            q.put(stripped)
     finally:
+        if log_fp:
+            log_fp.write(f"\n[CutClaw backend log] ended_at={datetime.now().isoformat()}\n")
+            log_fp.close()
         q.put(None)
 
 
@@ -599,12 +622,14 @@ def start_pipeline(video_path, audio_path, instruction, video_type, main_charact
         return str(e)
 
     q = queue.Queue()
-    t = threading.Thread(target=_read_stdout, args=(proc, q), daemon=True)
+    log_file_path = derive_backend_log_path(video_path, audio_path, instruction)
+    t = threading.Thread(target=_read_stdout, args=(proc, q, log_file_path, cmd), daemon=True)
     t.start()
 
     st.session_state.process = proc
     st.session_state.log_queue = q
     st.session_state.log_lines = []
+    st.session_state.log_file_path = log_file_path
     st.session_state.running = True
     st.session_state.pipeline_failed = False
     st.session_state.stage_status = {s: "pending" for s in _STAGE_NAMES}

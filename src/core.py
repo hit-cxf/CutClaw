@@ -5,6 +5,7 @@ import re
 import time
 import gc
 import threading
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Annotated as A
 import numpy as np
@@ -52,6 +53,33 @@ LEGACY_TOOL_NAME_MAP = {
 
 
 _THREAD_VIDEO_READERS = threading.local()
+_EDITOR_LOG_CONTEXT = threading.local()
+
+
+def _set_editor_log_context(section_idx=None, shot_idx=None):
+    _EDITOR_LOG_CONTEXT.section_idx = section_idx
+    _EDITOR_LOG_CONTEXT.shot_idx = shot_idx
+
+
+def _clear_editor_log_context():
+    _EDITOR_LOG_CONTEXT.section_idx = None
+    _EDITOR_LOG_CONTEXT.shot_idx = None
+
+
+def _editor_log(message="", section_idx=None, shot_idx=None):
+    if section_idx is None:
+        section_idx = getattr(_EDITOR_LOG_CONTEXT, "section_idx", None)
+    if shot_idx is None:
+        shot_idx = getattr(_EDITOR_LOG_CONTEXT, "shot_idx", None)
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if section_idx is not None and shot_idx is not None:
+        prefix = f"[{timestamp}][clip=S{section_idx + 1}-Shot{shot_idx + 1}]"
+    elif section_idx is not None:
+        prefix = f"[{timestamp}][clip=S{section_idx + 1}]"
+    else:
+        prefix = f"[{timestamp}][clip=-][Editor]"
+    print(f"{prefix} {message}", flush=True)
 
 
 def _get_thread_video_reader(video_path: str):
@@ -287,7 +315,7 @@ def commit(
 
         end_sec = clips[-1]['end_sec']
         end_time = clips[-1]['end_time']
-        print(f"✂️  [Trim] Auto-trimmed by {duration_diff:.2f}s. New end: {end_time}")
+        _editor_log(f"✂️  [Trim] Auto-trimmed by {duration_diff:.2f}s. New end: {end_time}")
 
     # Build result data with all clips
     result_clips = []
@@ -338,10 +366,10 @@ def commit(
 
         with open(output_path, 'w', encoding='utf-8') as f:
             json.dump(all_results, f, ensure_ascii=False, indent=2)
-        print(f"💾 [Output] Result saved to {output_path}")
+        _editor_log(f"💾 [Output] Result saved to {output_path}")
 
     success_msg = f"Successfully created edited video: {seconds_to_hhmmss(start_sec)} to {seconds_to_hhmmss(end_sec)} ({duration:.2f}s)"
-    print(f"✅ [Success] {success_msg}")
+    _editor_log(f"✅ [Success] {success_msg}")
 
     return json.dumps(result_data, ensure_ascii=False)
 
@@ -415,11 +443,11 @@ def semantic_neighborhood_retrieval(
                 f"Please select scenes within the allowed range or omit the 'related_scenes' parameter to use defaults."
             )
 
-        print(f"🗺️  [Explore] Agent exploring nearby scenes: {related_scenes} (recommended: {recommended_scenes})")
+        _editor_log(f"🗺️  [Explore] Agent exploring nearby scenes: {related_scenes} (recommended: {recommended_scenes})")
     elif not related_scenes and recommended_scenes:
         # Use recommended scenes if agent didn't specify
         related_scenes = recommended_scenes
-        print(f"🗺️  [Explore] Using recommended scenes: {related_scenes}")
+        _editor_log(f"🗺️  [Explore] Using recommended scenes: {related_scenes}")
 
     if not related_scenes:
         return "Error: No scenes specified and no recommended scenes available."
@@ -458,7 +486,7 @@ def semantic_neighborhood_retrieval(
                     all_shots_info.append(shot_info)
 
             except Exception as e:
-                print(f"⚠️  [Warning] Failed to load scene {scene_idx}: {e}")
+                _editor_log(f"⚠️  [Warning] Failed to load scene {scene_idx}: {e}")
                 all_shots_info.append(f"Scene {scene_idx}: Failed to load - {e}")
         else:
             all_shots_info.append(f"Scene {scene_idx}: File not found")
@@ -597,7 +625,7 @@ def fine_grained_shot_trimming(
             return joined
         except Exception as e:
             import traceback
-            traceback.print_exc()
+            _editor_log(traceback.format_exc())
             return ""
 
     
@@ -718,7 +746,7 @@ def fine_grained_shot_trimming(
                 raw = litellm.completion(**kwargs)
                 content_str = raw.choices[0].message.content
             except Exception as e:
-                print(f"❌ [Error] [trim_shot] litellm call failed: {e}")
+                _editor_log(f"❌ [Error] [trim_shot] litellm call failed: {e}")
                 content_str = None
 
             if not content_str:
@@ -731,7 +759,7 @@ def fine_grained_shot_trimming(
                 
                 # Debug: print the raw content to help diagnose issues
                 if not content:
-                    print(f"⚠️  [Warning] Empty content from model for time range {time_range}")
+                    _editor_log(f"⚠️  [Warning] Empty content from model for time range {time_range}")
                     if tries == 0:
                         return f"Error: Empty response from model for time range {time_range}."
                     continue
@@ -835,22 +863,22 @@ def fine_grained_shot_trimming(
 
                     min_coverage_ratio = 0.5  # Require at least 50% coverage
                     if coverage_ratio < min_coverage_ratio:
-                        print(f"⚠️ trim_shot output validation failed:")
-                        print(f"   Requested: {total_requested_duration:.2f}s ({clip_start_time} to {clip_end_time})")
-                        print(f"   Covered: {covered_duration:.2f}s (ratio: {coverage_ratio:.1%})")
-                        print(f"   Scenes returned: {len(result['internal_scenes'])}")
+                        _editor_log(f"⚠️ trim_shot output validation failed:")
+                        _editor_log(f"   Requested: {total_requested_duration:.2f}s ({clip_start_time} to {clip_end_time})")
+                        _editor_log(f"   Covered: {covered_duration:.2f}s (ratio: {coverage_ratio:.1%})")
+                        _editor_log(f"   Scenes returned: {len(result['internal_scenes'])}")
 
                         # Print scene details for debugging
                         for i, scene in enumerate(result["internal_scenes"]):
                             scene_time = scene.get("scene_time", "unknown")
                             scene_dur = scene.get("duration_sec", 0)
-                            print(f"   Scene {i+1}: {scene_time} ({scene_dur:.2f}s)")
+                            _editor_log(f"   Scene {i+1}: {scene_time} ({scene_dur:.2f}s)")
 
                         if tries > 0:
-                            print(f"   Retrying... ({tries} attempts remaining)")
+                            _editor_log(f"   Retrying... ({tries} attempts remaining)")
                             continue
                         else:
-                            print(f"   ⚠️ Max retries reached. Returning partial result.")
+                            _editor_log(f"   ⚠️ Max retries reached. Returning partial result.")
                             # Add warning to result
                             result["usability_assessment"] = (
                                 f"⚠️ WARNING: Model only provided {coverage_ratio:.0%} coverage of requested range. "
@@ -860,13 +888,13 @@ def fine_grained_shot_trimming(
                     return json.dumps(result, indent=4, ensure_ascii=False)
                 
             except json.JSONDecodeError as e:
-                print(f"❌ [Error] JSON decode error for time range {time_range}: {e}")
-                print(f"📄 [Data] Raw content (first 500 chars): {content_str[:500]}")
+                _editor_log(f"❌ [Error] JSON decode error for time range {time_range}: {e}")
+                _editor_log(f"📄 [Data] Raw content (first 500 chars): {content_str[:500]}")
                 if tries == 0:
                     return f"Error: Failed to parse model response for time range {time_range}. Content: {content_str[:200]}"
                 continue
             except Exception as e:
-                print(f"❌ [Error] Unexpected error processing response for time range {time_range}: {e}")
+                _editor_log(f"❌ [Error] Unexpected error processing response for time range {time_range}: {e}")
                 if tries == 0:
                     return f"Error: Unexpected error processing response: {str(e)}"
                 continue
@@ -948,12 +976,12 @@ class EditorCoreAgent:
                         completed.add((sec_idx, shot_idx))
 
             if completed:
-                print(f"📋 Found {len(completed)} completed shots in existing output file")
-                print(f"   Completed: {sorted(completed)}")
+                _editor_log(f"📋 Found {len(completed)} completed shots in existing output file")
+                _editor_log(f"   Completed: {sorted(completed)}")
 
             return completed
         except Exception as e:
-            print(f"⚠️ Error loading progress: {e}")
+            _editor_log(f"⚠️ Error loading progress: {e}")
             return set()
 
     def _construct_messages(self):
@@ -1080,11 +1108,11 @@ class EditorCoreAgent:
                         if response is not None:
                             break
                         else:
-                            print(f"🔄 [Retry] Model returned None, retrying ({model_retry + 1}/{max_model_retries})...")
+                            _editor_log(f"🔄 [Retry] Model returned None, retrying ({model_retry + 1}/{max_model_retries})...")
                     except Exception as e:
                         error_msg = str(e).lower()
                         if "context length" in error_msg or "too large" in error_msg or "max_tokens" in error_msg:
-                            print(f"❌ [Error] Context length exceeded: {e}")
+                            _editor_log(f"❌ [Error] Context length exceeded: {e}")
                             context_length_error = True
                             break
                         is_rate_limited = (
@@ -1100,29 +1128,30 @@ class EditorCoreAgent:
                             )
                             max_backoff = getattr(config, "AGENT_RATE_LIMIT_MAX_BACKOFF", 8.0)
                             wait_seconds = min(max_backoff, base_wait * (2 ** model_retry))
-                            print(
+                            _editor_log(
                                 f"Rate limit encountered, sleeping {wait_seconds:.1f}s "
                                 f"before retry ({model_retry + 1}/{max_model_retries})..."
                             )
                             time.sleep(wait_seconds)
-                        print(f"🔄 [Retry] Model call failed: {e}, retrying ({model_retry + 1}/{max_model_retries})...")
+                        _editor_log(f"🔄 [Retry] Model call failed: {e}, retrying ({model_retry + 1}/{max_model_retries})...")
                         if model_retry == max_model_retries - 1:
                             raise
 
                 if context_length_error:
-                    print("🔄 [Restart] Triggering restart due to context overflow...")
+                    _editor_log("🔄 [Restart] Triggering restart due to context overflow...")
                     should_restart = True
                     break
 
                 if response is None:
-                    print(f"❌ [Error] Model call failed after {max_model_retries} retries.")
+                    _editor_log(f"❌ [Error] Model call failed after {max_model_retries} retries.")
                     msgs[:] = msgs_snapshot
                     break
 
                 response.setdefault("role", "assistant")
                 msgs.append(response)
-                print("#### Iteration: ", i, f"(Tool retry: {tool_retry + 1}/{max_tool_retries})" if tool_retry > 0 else "")
-                print(response)
+                retry_suffix = f" (Tool retry: {tool_retry + 1}/{max_tool_retries})" if tool_retry > 0 else ""
+                _editor_log(f"#### Iteration: {i}{retry_suffix}")
+                _editor_log(response)
 
                 tool_execution_failed = False
 
@@ -1138,12 +1167,12 @@ class EditorCoreAgent:
                         is_final_answer = final_shot_pattern and (is_short_response or content.strip().endswith(']'))
 
                         if is_final_answer:
-                            print("✅ [Agent] Model returned final answer. Task completed.")
+                            _editor_log("✅ [Agent] Model returned final answer. Task completed.")
                             section_completed = True
                             tool_execution_success = True
                             break
                         else:
-                            print("⚠️  [Agent] Model did not call any tool. Adding prompt to use tools...")
+                            _editor_log("⚠️  [Agent] Model did not call any tool. Adding prompt to use tools...")
                             msgs.append({
                                 "role": "user",
                                 "content": EDITOR_USE_TOOL_PROMPT
@@ -1159,7 +1188,7 @@ class EditorCoreAgent:
                             break
 
                     if should_restart:
-                        print("🔄 [Restart] Restarting conversation for current shot...")
+                        _editor_log("🔄 [Restart] Restarting conversation for current shot...")
                         break
 
                     tool_execution_success = True
@@ -1167,9 +1196,9 @@ class EditorCoreAgent:
                 except StopException:
                     return True, False
                 except Exception as e:
-                    print(f"❌ [Error] Error executing tool calls: {e}")
+                    _editor_log(f"❌ [Error] Error executing tool calls: {e}")
                     import traceback
-                    traceback.print_exc()
+                    _editor_log(traceback.format_exc())
                     for tc in (response.get("tool_calls") or []):
                         self._append_tool_msg(
                             tc["id"],
@@ -1184,7 +1213,7 @@ class EditorCoreAgent:
                     break
 
                 if tool_execution_failed:
-                    print("🔄 [Retry] Rolling back messages and retrying...")
+                    _editor_log("🔄 [Retry] Rolling back messages and retrying...")
                     del msgs[msgs_snapshot_len:]
                     continue
 
@@ -1192,7 +1221,7 @@ class EditorCoreAgent:
                 break
 
             if section_completed:
-                print(f"⏭️  [Progress] Shot {self.current_shot_idx + 1} completed. Moving to next shot...")
+                _editor_log(f"⏭️  [Progress] Shot {self.current_shot_idx + 1} completed. Moving to next shot...")
                 break
 
         return section_completed, should_restart
@@ -1233,10 +1262,10 @@ class EditorCoreAgent:
             agent_requested_scenes = args.get("related_scenes", [])
             if agent_requested_scenes and isinstance(agent_requested_scenes, list):
                 # Agent explicitly requested specific scenes - will be validated in function
-                print(f"📍 Agent requested scenes: {agent_requested_scenes}")
+                _editor_log(f"📍 Agent requested scenes: {agent_requested_scenes}")
             else:
                 # No agent request, will use default recommended related scenes in function
-                print(f"📍 No specific scenes requested, will use recommended: {self.current_related_scenes}")
+                _editor_log(f"📍 No specific scenes requested, will use recommended: {self.current_related_scenes}")
 
             # Inject both scene_folder_path and recommended_scenes for validation
             args["scene_folder_path"] = self.video_scene_path
@@ -1267,10 +1296,10 @@ class EditorCoreAgent:
 
             if normalized_range in self.attempted_time_ranges:
                 self.duplicate_call_count += 1
-                print(f"⚠️ Duplicate call detected ({self.duplicate_call_count}/{self.max_duplicate_calls}): {normalized_range}")
+                _editor_log(f"⚠️ Duplicate call detected ({self.duplicate_call_count}/{self.max_duplicate_calls}): {normalized_range}")
 
                 if self.duplicate_call_count >= self.max_duplicate_calls:
-                    print(f"🔄 Max duplicate calls reached. Restarting conversation for this shot...")
+                    _editor_log(f"🔄 Max duplicate calls reached. Restarting conversation for this shot...")
                     return "RESTART"  # Signal to restart the conversation
 
                 # Return a helpful message instead of calling the tool again
@@ -1292,7 +1321,7 @@ class EditorCoreAgent:
         # For review_clip, inject used_time_ranges
         if canonical_name == "review_clip":
             args["used_time_ranges"] = self.used_time_ranges + (self.forbidden_time_ranges or [])
-            print(f"📍 Checking overlap against {len(self.used_time_ranges)} used clips")
+            _editor_log(f"📍 Checking overlap against {len(self.used_time_ranges)} used clips")
 
         # For commit, first call ReviewerAgent to validate
         if canonical_name == "commit":
@@ -1340,10 +1369,10 @@ class EditorCoreAgent:
 
                         face_check_method = getattr(config, 'FACE_QUALITY_CHECK_METHOD', 'vlm')
                         if face_check_method != 'vlm':
-                            print("⚠️  FACE_QUALITY_CHECK_METHOD is not 'vlm'; falling back to 'vlm' (face_recognition removed).")
+                            _editor_log("⚠️  FACE_QUALITY_CHECK_METHOD is not 'vlm'; falling back to 'vlm' (face_recognition removed).")
                             face_check_method = 'vlm'
 
-                        print("🎬 Using VLM face quality check method...")
+                        _editor_log("🎬 Using VLM face quality check method...")
                         face_check, protagonist_frame_data = self.reviewer.check_face_quality_vlm(
                             video_path=args.get("video_path", ""),
                             time_range=time_range,
@@ -1378,7 +1407,7 @@ class EditorCoreAgent:
                     context_data = self.current_shot_context.get("protagonist_frame_data", None)
                     if context_data:
                         args["protagonist_frame_data"] = context_data
-                        print(f"✅ Set protagonist_frame_data from context: {len(context_data)} detections")
+                        _editor_log(f"✅ Set protagonist_frame_data from context: {len(context_data)} detections")
                     else:
                         args["protagonist_frame_data"] = None
 
@@ -1467,7 +1496,8 @@ class EditorCoreAgent:
         """
 
         # Load shot plan from file
-        print(f"📂 [Init] Loading shot plan from: {shot_plan_path}")
+        _clear_editor_log_context()
+        _editor_log(f"📂 [Init] Loading shot plan from: {shot_plan_path}")
         with open(shot_plan_path, 'r', encoding='utf-8') as f:
             structure_proposal = json.load(f)
 
@@ -1476,38 +1506,40 @@ class EditorCoreAgent:
 
         # Store original output path and create section-specific paths
         original_output_path = self.output_path
-        print("📄 [Data] structure_proposal: ", structure_proposal)
+        _editor_log(f"📄 [Data] structure_proposal: {structure_proposal}")
         for sec_idx, sec_cur in enumerate(structure_proposal['video_structure']):
-            print(f"\n{'='*60}")
-            print(f"Processing Section {sec_idx + 1}/{len(structure_proposal['video_structure'])}")
-            print(f"{'='*60}\n")
+            _set_editor_log_context(sec_idx, None)
+            _editor_log(f"{'='*60}")
+            _editor_log(f"Processing Section {sec_idx + 1}/{len(structure_proposal['video_structure'])}")
+            _editor_log(f"{'='*60}")
             # Set current section for reporting
             self.current_section_idx = sec_idx
             
             # Load shot_plan from sec_cur (loaded from file)
             shot_plan = sec_cur.get('shot_plan')
             if not shot_plan:
-                print(f"❌ [Error] No shot_plan found for section {sec_idx}")
+                _editor_log(f"❌ [Error] No shot_plan found for section {sec_idx}")
                 continue
-            print("Using shot plan from file")
+            _editor_log("Using shot plan from file")
             for idx, shot in enumerate(shot_plan['shots']):
+                _set_editor_log_context(sec_idx, idx)
                 # Check if this shot is already completed (resume functionality)
                 if (sec_idx, idx) in completed_shots:
-                    print(f"\n⏭️  Skipping Shot {idx + 1}/{len(shot_plan['shots'])} - Already completed")
+                    _editor_log(f"⏭️  Skipping Shot {idx + 1}/{len(shot_plan['shots'])} - Already completed")
                     continue
 
                 max_shot_restarts = 3  # Max restarts per shot
                 for restart_attempt in range(max_shot_restarts):
                     if restart_attempt > 0:
-                        print(f"\nRestart attempt {restart_attempt + 1}/{max_shot_restarts} for Shot {idx + 1}")
+                        _editor_log(f"Restart attempt {restart_attempt + 1}/{max_shot_restarts} for Shot {idx + 1}")
 
-                    print(f"\n{'='*60}")
-                    print(f"Processing Shot {idx + 1}/{len(shot_plan['shots'])}")
-                    print(f"{'='*60}\n")
-                    print("shot plan: ", shot)
+                    _editor_log(f"{'='*60}")
+                    _editor_log(f"Processing Shot {idx + 1}/{len(shot_plan['shots'])}")
+                    _editor_log(f"{'='*60}")
+                    _editor_log(f"shot plan: {shot}")
 
                     self.output_path = original_output_path
-                    print(f"Output path: {self.output_path}")
+                    _editor_log(f"Output path: {self.output_path}")
                     self.current_shot_idx = idx
                     self.attempted_time_ranges = set()
                     self.duplicate_call_count = 0
@@ -1543,13 +1575,14 @@ class EditorCoreAgent:
                     if section_completed:
                         break
                     if not should_restart:
-                        print(f"Max iterations reached for Shot {idx + 1}. Moving to next shot.")
+                        _editor_log(f"Max iterations reached for Shot {idx + 1}. Moving to next shot.")
                         break
 
                 # End restart loop
 
             # End of shot loop
-            print(f"\nSection {sec_idx + 1} completed. All shots processed.")
+            _set_editor_log_context(sec_idx, None)
+            _editor_log(f"Section {sec_idx + 1} completed. All shots processed.")
 
         return msgs
 
@@ -1561,6 +1594,7 @@ class EditorCoreAgent:
         self.output_path = ""
         self.current_section_idx = sec_idx
         self.current_shot_idx = shot_idx
+        _set_editor_log_context(sec_idx, shot_idx)
         self.forbidden_time_ranges = forbidden_time_ranges or []
         self.guidance_text = guidance_text
         self.last_commit_result = None
@@ -1588,7 +1622,7 @@ class EditorCoreAgent:
 
         for restart_attempt in range(max_shot_restarts):
             if restart_attempt > 0:
-                print(f"Restart attempt {restart_attempt + 1}/{max_shot_restarts} for Shot {shot_idx + 1}")
+                _editor_log(f"Restart attempt {restart_attempt + 1}/{max_shot_restarts} for Shot {shot_idx + 1}")
 
             self.attempted_time_ranges = set()
             self.duplicate_call_count = 0
@@ -1624,6 +1658,7 @@ class EditorCoreAgent:
         self.video_reader = None
         _clear_thread_video_reader()
         _clear_thread_video_reader()
+        _clear_editor_log_context()
         gc.collect()
 
 
@@ -1641,6 +1676,9 @@ class ParallelShotOrchestrator:
         self.max_workers = max_workers or getattr(config, 'PARALLEL_SHOT_MAX_WORKERS', 4)
         self.max_reruns = max_reruns if max_reruns is not None else getattr(config, 'PARALLEL_SHOT_MAX_RERUNS', 2)
         self._output_lock = threading.Lock()
+
+    def _log(self, message="", sec_idx=None, shot_idx=None):
+        _editor_log(message, section_idx=sec_idx, shot_idx=shot_idx)
 
     def _compute_quality_score(self, result_data: dict) -> float:
         if not result_data:
@@ -1718,7 +1756,8 @@ class ParallelShotOrchestrator:
 
     def _run_worker(self, shot, sec_idx, shot_idx, guidance_text=None, forbidden_time_ranges=None):
         mode = "rerun" if guidance_text else "initial"
-        print(f"[SubAgent S{sec_idx + 1} Shot{shot_idx + 1}] start ({mode})")
+        _set_editor_log_context(sec_idx, shot_idx)
+        self._log(f"[SubAgent S{sec_idx + 1} Shot{shot_idx + 1}] start ({mode})", sec_idx, shot_idx)
         agent = EditorCoreAgent(
             self.video_caption_path,
             self.video_scene_path,
@@ -1738,15 +1777,16 @@ class ParallelShotOrchestrator:
                 forbidden_time_ranges=forbidden_time_ranges
             )
             if result:
-                print(f"[SubAgent S{sec_idx + 1} Shot{shot_idx + 1}] success")
+                self._log(f"[SubAgent S{sec_idx + 1} Shot{shot_idx + 1}] success", sec_idx, shot_idx)
                 self._append_result_to_output((sec_idx, shot_idx), result)
             else:
-                print(f"[SubAgent S{sec_idx + 1} Shot{shot_idx + 1}] no-result")
+                self._log(f"[SubAgent S{sec_idx + 1} Shot{shot_idx + 1}] no-result", sec_idx, shot_idx)
             return result
         finally:
             agent.cleanup()
             # Explicitly clear thread-local video reader in this worker thread
             _clear_thread_video_reader()
+            _clear_editor_log_context()
             gc.collect()
 
     def _merge_results(self, existing_list: list, new_results: dict) -> list:
@@ -1770,7 +1810,7 @@ class ParallelShotOrchestrator:
         merged = self._merge_results(existing_list, new_results)
         with open(self.output_path, 'w', encoding='utf-8') as f:
             json.dump(merged, f, ensure_ascii=False, indent=2)
-        print(f"[Parallel] checkpoint saved: {len(merged)} shots")
+        self._log(f"[Parallel] checkpoint saved: {len(merged)} shots")
 
     def _append_result_to_output(self, key: tuple, result: dict):
         if not self.output_path or not result:
@@ -1786,11 +1826,12 @@ class ParallelShotOrchestrator:
             merged = self._merge_results(existing, {key: result})
             with open(self.output_path, 'w', encoding='utf-8') as f:
                 json.dump(merged, f, ensure_ascii=False, indent=2)
-            print(f"[Parallel] subagent saved: section={key[0]} shot={key[1]}")
+            self._log(f"[Parallel] subagent saved: section={key[0]} shot={key[1]}", key[0], key[1])
 
     def run_parallel(self, shot_plan_path: str):
         with open(shot_plan_path, 'r', encoding='utf-8') as f:
             structure_proposal = json.load(f)
+        _clear_editor_log_context()
 
         global_keep_ranges = []
         final_results = {}
@@ -1816,16 +1857,16 @@ class ParallelShotOrchestrator:
                 global_keep_ranges.append((r_start, r_end))
 
         if completed_shots:
-            print(f"📋 [Parallel] Found {len(completed_shots)} completed shots in existing output file")
-            print(f"   Completed: {sorted(completed_shots)}")
+            self._log(f"📋 [Parallel] Found {len(completed_shots)} completed shots in existing output file")
+            self._log(f"   Completed: {sorted(completed_shots)}")
 
         for sec_idx, sec_cur in enumerate(structure_proposal['video_structure']):
             shot_plan = sec_cur.get('shot_plan')
             if not shot_plan:
-                print(f"❌ [Error] No shot_plan found for section {sec_idx}")
+                self._log(f"❌ [Error] No shot_plan found for section {sec_idx}", sec_idx)
                 continue
             shots = shot_plan['shots']
-            print(f"\n[Parallel] Processing Section {sec_idx + 1}/{len(structure_proposal['video_structure'])}")
+            self._log(f"[Parallel] Processing Section {sec_idx + 1}/{len(structure_proposal['video_structure'])}", sec_idx)
 
             pending = {}
             skipped_in_section = 0
@@ -1837,9 +1878,9 @@ class ParallelShotOrchestrator:
                 pending[key] = shot
 
             if skipped_in_section:
-                print(f"[Parallel][Section {sec_idx + 1}] skipped {skipped_in_section} completed shots")
+                self._log(f"[Parallel][Section {sec_idx + 1}] skipped {skipped_in_section} completed shots", sec_idx)
             if not pending:
-                print(f"[Parallel][Section {sec_idx + 1}] all shots already completed")
+                self._log(f"[Parallel][Section {sec_idx + 1}] all shots already completed", sec_idx)
                 continue
 
             pending_guidance = {key: None for key in pending}
@@ -1851,9 +1892,10 @@ class ParallelShotOrchestrator:
                 round_idx += 1
                 results = {}
                 combined_keep_ranges = global_keep_ranges + section_keep_ranges
-                print(
+                self._log(
                     f"[Parallel][Section {sec_idx + 1}][Round {round_idx}] "
-                    f"pending={len(pending)} rerun_count={rerun_count}/{self.max_reruns}"
+                    f"pending={len(pending)} rerun_count={rerun_count}/{self.max_reruns}",
+                    sec_idx,
                 )
 
                 with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
@@ -1874,13 +1916,14 @@ class ParallelShotOrchestrator:
                         try:
                             results[key] = future.result()
                         except Exception as e:
-                            print(f"Worker failed for shot {key}: {e}")
+                            self._log(f"Worker failed for shot {key}: {e}", key[0], key[1])
                             results[key] = None
 
                 losers = self._detect_conflicts(results, combined_keep_ranges)
-                print(
+                self._log(
                     f"[Parallel][Section {sec_idx + 1}][Round {round_idx}] "
-                    f"conflicts={len(losers)} winners={len(results) - len(losers)}"
+                    f"conflicts={len(losers)} winners={len(results) - len(losers)}",
+                    sec_idx,
                 )
 
                 # Keep winners
@@ -1898,13 +1941,14 @@ class ParallelShotOrchestrator:
                     self._save_checkpoint(existing, final_results)
 
                 if not losers:
-                    print(f"[Parallel][Section {sec_idx + 1}] no conflicts remaining")
+                    self._log(f"[Parallel][Section {sec_idx + 1}] no conflicts remaining", sec_idx)
                     break
 
                 if rerun_count >= self.max_reruns:
-                    print(
+                    self._log(
                         f"[Parallel][Section {sec_idx + 1}] reached max reruns "
-                        f"({self.max_reruns}), stop rerunning unresolved shots"
+                        f"({self.max_reruns}), stop rerunning unresolved shots",
+                        sec_idx,
                     )
                     break
 

@@ -41,9 +41,9 @@ _load_project_env()
 # ------------------ UI Remembered Inputs ------------------ #
 # These are saved automatically by the app when you change sidebar fields.
 
-VIDEO_PATH = "resource/video/[世界杯]E组第1轮：德国VS库拉索.mp4"
-AUDIO_PATH = "resource/audio/mixkit-sports-highlights-51.mp3"
-INSTRUCTION = "德国7:1大胜库拉索，做这场比赛所有进球的精彩剪辑"
+VIDEO_PATH = "resource/video/[世界杯]E组第2轮：阿瓜多尔VS库拉索.mp4"
+AUDIO_PATH = "resource/audio/mixkit-tech-house-vibes-130.mp3"
+INSTRUCTION = "中国裁判马宁世界杯首秀，全场共出示6张黄牌，恪守规则，人送外号“卡牌大师”。作主裁马宁的精彩剪辑"
 SRT_PATH = ""
 
 
@@ -323,10 +323,10 @@ AUDIO_SILENCE_THRESHOLD_DB = -45.0
 # Segments below this level are treated as too quiet and filtered.
 
 # ----- Audio segment duration constraints (frequently tuned) -----
-AUDIO_MIN_SEGMENT_DURATION = 1.0
+AUDIO_MIN_SEGMENT_DURATION = 3.0
 # Minimum segment duration (seconds). Smaller values create faster cuts.
 
-AUDIO_MAX_SEGMENT_DURATION = 3.0
+AUDIO_MAX_SEGMENT_DURATION = 5.0
 # Maximum segment duration (seconds). Larger values create slower pacing.
 
 # ----- Music structure analysis (Level-1) -----
@@ -371,7 +371,7 @@ AGENT_MODEL_MAX_TOKEN = 8192
 AGENT_MODEL_MAX_RETRIES = 4
 # Max retries per agent step when model calls fail.
 
-AGENT_LITELLM_TIMEOUT = 120
+AGENT_LITELLM_TIMEOUT = 300
 # Timeout (seconds) for agent-model completion calls.
 
 AGENT_RATE_LIMIT_BACKOFF_BASE = 1.0
