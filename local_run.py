@@ -98,6 +98,9 @@ def json_has_content(path: str | None) -> bool:
 
 
 def main():
+    from src.model_usage import configure_model_usage
+
+    model_usage = configure_model_usage()
     parser = argparse.ArgumentParser(description="Run VideoCaptioningAgent on a video.")
     parser.add_argument("--Video_Path", help="The URL of the video to process.", default="Dataset/Video/Movie/La_La_Land.mkv")
     parser.add_argument("--Audio_Path", help="The URL of the video to process.", default="Dataset/Audio/Norman_fucking_rockwell.mp3")
@@ -450,6 +453,9 @@ def main():
     
 
 
+
+    if model_usage is not None:
+        model_usage.phase = "planning"
 
     # Step 5: Run Screenwriter to generate shot plan
     if os.path.exists(scene_summaries_dir) and os.path.exists(audio_caption_file):
